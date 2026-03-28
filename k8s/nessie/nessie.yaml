@@ -1,0 +1,97 @@
+---
+# Nessie ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nessie-config
+  namespace: nessie
+data:
+  QUARKUS_HTTP_PORT: "19120"
+  NESSIE_VERSION_STORE_TYPE: "IN_MEMORY"
+  QUARKUS_LOG_LEVEL: "INFO"
+  QUARKUS_LOG_CONSOLE_FORMAT: "%d{HH:mm:ss} %-5p [%c{2.}] (%t) %s%e%n"
+
+---
+# Nessie Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nessie
+  namespace: nessie
+  labels:
+    app: nessie
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: nessie
+  template:
+    metadata:
+      labels:
+        app: nessie
+    spec:
+      containers:
+        - name: nessie
+          image: ghcr.io/projectnessie/nessie:0.76.3
+          envFrom:
+            - configMapRef:
+                name: nessie-config
+          ports:
+            - containerPort: 19120
+              name: api
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /q/health/live
+              port: 19120
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 5
+          readinessProbe:
+            httpGet:
+              path: /q/health/ready
+              port: 19120
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+
+---
+# Nessie ClusterIP Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: nessie
+  namespace: nessie
+  labels:
+    app: nessie
+spec:
+  selector:
+    app: nessie
+  ports:
+    - name: api
+      port: 19120
+      targetPort: 19120
+  type: ClusterIP
+
+---
+# Nessie NodePort Service (for local access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: nessie-nodeport
+  namespace: nessie
+spec:
+  selector:
+    app: nessie
+  ports:
+    - name: api
+      port: 19120
+      targetPort: 19120
+      nodePort: 30019
+  type: NodePort

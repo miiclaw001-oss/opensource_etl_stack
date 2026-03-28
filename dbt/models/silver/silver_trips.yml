@@ -1,0 +1,91 @@
+version: 2
+
+models:
+  - name: silver_trips
+    description: >
+      Cleaned and enriched NYC taxi trip records. Applies data quality filters,
+      business rule validation, and feature engineering on top of the raw Iceberg table.
+      Incrementally loaded using merge strategy on (vendor_id, pickup_datetime, pu_location_id).
+
+    columns:
+      - name: vendor_id
+        description: "Taxi vendor identifier (1 or 2)"
+        tests:
+          - not_null
+          - accepted_values:
+              values: [1, 2]
+
+      - name: tpep_pickup_datetime
+        description: "Pickup timestamp (validated not null)"
+        tests:
+          - not_null
+
+      - name: tpep_dropoff_datetime
+        description: "Dropoff timestamp (validated > pickup)"
+        tests:
+          - not_null
+
+      - name: passenger_count
+        description: "Number of passengers"
+
+      - name: trip_distance
+        description: "Trip distance in miles (validated 0.1–100)"
+        tests:
+          - not_null
+
+      - name: payment_type
+        description: "Payment method code"
+        tests:
+          - accepted_values:
+              values: [1, 2, 3, 4, 5, 6]
+
+      - name: payment_type_label
+        description: "Human-readable payment method"
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['credit_card', 'cash', 'no_charge', 'dispute', 'unknown']
+
+      - name: fare_amount
+        description: "Meter fare (validated 1–500)"
+        tests:
+          - not_null
+
+      - name: total_amount
+        description: "Total charge (validated > 0)"
+        tests:
+          - not_null
+
+      - name: time_of_day
+        description: "Time-of-day bucket"
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['morning_rush', 'midday', 'evening_rush', 'evening', 'overnight']
+
+      - name: day_name
+        description: "Day of week name"
+        tests:
+          - not_null
+
+      - name: is_weekend
+        description: "True if Saturday or Sunday"
+        tests:
+          - not_null
+
+      - name: was_tipped
+        description: "True if tip_amount > 0"
+        tests:
+          - not_null
+
+      - name: avg_speed_mph
+        description: "Calculated average speed in mph"
+
+      - name: tip_pct
+        description: "Tip as percentage of fare"
+
+      - name: fare_per_mile
+        description: "Fare divided by trip distance"
+
+      - name: revenue_per_minute
+        description: "Total amount per minute of trip"

@@ -1,0 +1,216 @@
+---
+# Airbyte Namespace (already in namespaces.yaml, but services here)
+# Airbyte is deployed via Helm chart in the setup script
+# This manifest provides a simple standalone Airbyte deployment for testing
+
+# Airbyte DB
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: airbyte-db-pvc
+  namespace: airbyte
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airbyte-db
+  namespace: airbyte
+  labels:
+    app: airbyte-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airbyte-db
+  template:
+    metadata:
+      labels:
+        app: airbyte-db
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:13-alpine
+          env:
+            - name: POSTGRES_USER
+              value: "airbyte"
+            - name: POSTGRES_PASSWORD
+              value: "password"
+            - name: POSTGRES_DB
+              value: "airbyte"
+          ports:
+            - containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+              subPath: airbyte
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "airbyte"]
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: airbyte-db-pvc
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airbyte-db
+  namespace: airbyte
+spec:
+  selector:
+    app: airbyte-db
+  ports:
+    - port: 5432
+      targetPort: 5432
+  type: ClusterIP
+
+---
+# Airbyte ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: airbyte-env
+  namespace: airbyte
+data:
+  AIRBYTE_VERSION: "0.50.45"
+  API_URL: "/api/v1/"
+  TRACKING_STRATEGY: "logging"
+  WORKER_ENVIRONMENT: "kubernetes"
+  S3_LOG_BUCKET: "warehouse"
+  S3_LOG_BUCKET_REGION: "us-east-1"
+  S3_MINIO_ENDPOINT: "http://minio.minio.svc.cluster.local:9000"
+  AWS_ACCESS_KEY_ID: "minioadmin"
+  AWS_SECRET_ACCESS_KEY: "minioadmin123"
+  DATABASE_HOST: "airbyte-db"
+  DATABASE_PORT: "5432"
+  DATABASE_DB: "airbyte"
+  DATABASE_USER: "airbyte"
+  DATABASE_PASSWORD: "password"
+  WORKSPACE_ROOT: "/tmp/workspace"
+  LOCAL_ROOT: "/tmp/airbyte_local"
+  WEBAPP_URL: "http://localhost:8000/"
+  INTERNAL_API_HOST: "airbyte-server:8001"
+  CONNECTOR_REGISTRY_SEED_PROVIDER: "local"
+
+---
+# Airbyte Server Deployment (lightweight standalone)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airbyte-server
+  namespace: airbyte
+  labels:
+    app: airbyte-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airbyte-server
+  template:
+    metadata:
+      labels:
+        app: airbyte-server
+    spec:
+      initContainers:
+        - name: wait-for-db
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - until nc -z airbyte-db 5432; do echo "Waiting for DB..."; sleep 2; done
+      containers:
+        - name: airbyte-server
+          image: airbyte/server:0.50.45
+          envFrom:
+            - configMapRef:
+                name: airbyte-env
+          ports:
+            - containerPort: 8001
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airbyte-server
+  namespace: airbyte
+spec:
+  selector:
+    app: airbyte-server
+  ports:
+    - port: 8001
+      targetPort: 8001
+  type: ClusterIP
+
+---
+# Airbyte Webapp
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: airbyte-webapp
+  namespace: airbyte
+  labels:
+    app: airbyte-webapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: airbyte-webapp
+  template:
+    metadata:
+      labels:
+        app: airbyte-webapp
+    spec:
+      containers:
+        - name: webapp
+          image: airbyte/webapp:0.50.45
+          envFrom:
+            - configMapRef:
+                name: airbyte-env
+          ports:
+            - containerPort: 8080
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: airbyte-webapp-nodeport
+  namespace: airbyte
+spec:
+  selector:
+    app: airbyte-webapp
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30800
+  type: NodePort

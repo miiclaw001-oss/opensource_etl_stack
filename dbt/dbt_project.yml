@@ -1,0 +1,57 @@
+name: 'nyc_taxi_iceberg'
+version: '1.0.0'
+config-version: 2
+
+profile: 'nyc_taxi_iceberg'
+
+# Model path configuration
+model-paths: ["models"]
+analysis-paths: ["analyses"]
+test-paths: ["tests"]
+seed-paths: ["seeds"]
+macro-paths: ["macros"]
+snapshot-paths: ["snapshots"]
+
+target-path: "target"
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# Model configurations
+models:
+  nyc_taxi_iceberg:
+    # Raw layer: source data as-is (external Iceberg tables)
+    raw:
+      +materialized: view
+      +schema: raw
+      +tags: ["raw", "source"]
+
+    # Silver layer: cleaned and typed data
+    silver:
+      +materialized: incremental
+      +schema: silver
+      +tags: ["silver", "cleaned"]
+      +incremental_strategy: merge
+      +file_format: iceberg
+      +partition_by:
+        field: pickup_date
+        granularity: day
+
+    # Gold layer: aggregated analytics-ready data
+    gold:
+      +materialized: table
+      +schema: gold
+      +tags: ["gold", "analytics"]
+      +file_format: iceberg
+      +partition_by:
+        field: pickup_date
+        granularity: day
+
+# Variable defaults
+vars:
+  min_trip_distance: 0.1
+  max_trip_distance: 100.0
+  min_fare_amount: 1.0
+  max_fare_amount: 500.0
+  min_trip_duration_minutes: 1
+  max_trip_duration_minutes: 240

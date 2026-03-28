@@ -1,0 +1,35 @@
+nyc_taxi_iceberg:
+  target: dev
+  outputs:
+    # Local development (Spark Thrift Server)
+    dev:
+      type: spark
+      method: thrift
+      host: localhost
+      port: 10001
+      schema: silver
+      connect_retries: 5
+      connect_timeout: 60
+      threads: 2
+
+    # Kubernetes cluster (Spark Thrift Server in-cluster)
+    prod:
+      type: spark
+      method: thrift
+      host: spark-thrift.spark.svc.cluster.local
+      port: 10001
+      schema: silver
+      connect_retries: 10
+      connect_timeout: 120
+      threads: 4
+
+    # Docker Compose environment
+    docker:
+      type: spark
+      method: thrift
+      host: spark-thrift
+      port: 10001
+      schema: silver
+      connect_retries: 5
+      connect_timeout: 60
+      threads: 2

@@ -1,0 +1,429 @@
+version: "3.8"
+
+# =============================================================================
+# Local ETL Stack - Docker Compose
+# Alternative to Kubernetes for local development
+# Services: MinIO + Nessie + Spark + Airflow + Airbyte + dbt
+# Total RAM: ~6-8GB
+# =============================================================================
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.0
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__FERNET_KEY: "ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg="
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow123@postgres:5432/airflow
+    AIRFLOW__WEBSERVER__SECRET_KEY: "etl-stack-secret-key-2024"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW_CONN_SPARK_DEFAULT: "spark://spark-master:7077"
+    AWS_ACCESS_KEY_ID: "${MINIO_ROOT_USER:-minioadmin}"
+    AWS_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD:-minioadmin123}"
+    AWS_DEFAULT_REGION: "us-east-1"
+    MINIO_ENDPOINT: "http://minio:9000"
+    NESSIE_URI: "http://nessie:19120/api/v1"
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - airflow-logs:/opt/airflow/logs
+    - airflow-plugins:/opt/airflow/plugins
+    - /tmp/etl-data:/tmp/etl-data
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - etl-network
+  restart: unless-stopped
+
+services:
+
+  # ── MinIO (S3-compatible storage) ──────────────────────────────────────────
+  minio:
+    image: quay.io/minio/minio:RELEASE.2024-01-18T22-51-28Z
+    container_name: etl-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: "${MINIO_ROOT_USER:-minioadmin}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-minioadmin123}"
+      MINIO_SITE_NAME: "etl-minio"
+    ports:
+      - "9000:9000"   # API
+      - "9001:9001"   # Console
+    volumes:
+      - minio-data:/data
+    networks:
+      - etl-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+  # MinIO bucket initialization
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2024-01-18T07-03-39Z
+    container_name: etl-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin123 &&
+        mc mb --ignore-existing local/warehouse &&
+        mc mb --ignore-existing local/warehouse-raw &&
+        mc mb --ignore-existing local/warehouse-silver &&
+        mc mb --ignore-existing local/warehouse-gold &&
+        mc mb --ignore-existing local/spark-logs &&
+        echo 'MinIO buckets initialized'
+      "
+    networks:
+      - etl-network
+
+  # ── Project Nessie (Iceberg REST Catalog) ─────────────────────────────────
+  nessie:
+    image: ghcr.io/projectnessie/nessie:0.76.3
+    container_name: etl-nessie
+    environment:
+      QUARKUS_HTTP_PORT: "19120"
+      NESSIE_VERSION_STORE_TYPE: "IN_MEMORY"
+      QUARKUS_LOG_LEVEL: "INFO"
+    ports:
+      - "19120:19120"
+    networks:
+      - etl-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:19120/q/health/ready"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+  # ── Apache Spark Master ────────────────────────────────────────────────────
+  spark-master:
+    image: apache/spark:3.5.0-scala2.12-java17-python3-ubuntu
+    container_name: etl-spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      SPARK_MASTER_HOST: "0.0.0.0"
+      SPARK_MASTER_PORT: "7077"
+      SPARK_MASTER_WEBUI_PORT: "8090"
+      SPARK_NO_DAEMONIZE: "true"
+    ports:
+      - "7077:7077"   # Spark master
+      - "8090:8090"   # Spark master UI
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - spark-work:/opt/spark/work
+    networks:
+      - etl-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+  # ── Apache Spark Worker ────────────────────────────────────────────────────
+  spark-worker:
+    image: apache/spark:3.5.0-scala2.12-java17-python3-ubuntu
+    container_name: etl-spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      SPARK_WORKER_MEMORY: "2g"
+      SPARK_WORKER_CORES: "2"
+      SPARK_WORKER_WEBUI_PORT: "8091"
+      SPARK_NO_DAEMONIZE: "true"
+    ports:
+      - "8091:8091"   # Worker UI
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - spark-work:/opt/spark/work
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    networks:
+      - etl-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2.5g
+          cpus: "2.0"
+
+  # ── Spark Thrift Server (for dbt) ──────────────────────────────────────────
+  spark-thrift:
+    image: apache/spark:3.5.0-scala2.12-java17-python3-ubuntu
+    container_name: etl-spark-thrift
+    command: >
+      /bin/bash -c "
+        /opt/spark/sbin/start-thriftserver.sh \
+          --master spark://spark-master:7077 \
+          --hiveconf hive.server2.thrift.port=10001 \
+          --hiveconf hive.server2.thrift.bind.host=0.0.0.0 \
+          --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+          --conf spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog \
+          --conf spark.sql.catalog.nessie.catalog-impl=org.apache.iceberg.nessie.NessieCatalog \
+          --conf spark.sql.catalog.nessie.uri=http://nessie:19120/api/v1 \
+          --conf spark.sql.catalog.nessie.ref=main \
+          --conf spark.sql.catalog.nessie.warehouse=s3://warehouse/ \
+          --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
+          --conf spark.hadoop.fs.s3a.access.key=minioadmin \
+          --conf spark.hadoop.fs.s3a.secret.key=minioadmin123 \
+          --conf spark.hadoop.fs.s3a.path.style.access=true \
+          --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.3,org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.76.3,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 &&
+        tail -f /opt/spark/logs/*thriftserver*
+      "
+    ports:
+      - "10001:10001"  # Thrift Server
+      - "4040:4040"    # Spark UI
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      nessie:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - etl-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+
+  # ── PostgreSQL (shared metadata) ───────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: etl-postgres
+    environment:
+      POSTGRES_USER: "airflow"
+      POSTGRES_PASSWORD: "airflow123"
+      POSTGRES_DB: "airflow"
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    networks:
+      - etl-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
+
+  # ── Airflow Init ───────────────────────────────────────────────────────────
+  airflow-init:
+    <<: *airflow-common
+    container_name: etl-airflow-init
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create \
+          --username admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com \
+          --password admin123 || true &&
+        echo 'Airflow initialized'
+      "
+    restart: "no"
+
+  # ── Airflow Webserver ──────────────────────────────────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: etl-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+  # ── Airflow Scheduler ──────────────────────────────────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: etl-airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+  # ── Airbyte (data ingestion) ───────────────────────────────────────────────
+  airbyte-db:
+    image: postgres:13-alpine
+    container_name: etl-airbyte-db
+    environment:
+      POSTGRES_USER: "airbyte"
+      POSTGRES_PASSWORD: "password"
+      POSTGRES_DB: "airbyte"
+    volumes:
+      - airbyte-db-data:/var/lib/postgresql/data
+    networks:
+      - etl-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airbyte"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.25"
+
+  airbyte-server:
+    image: airbyte/server:0.50.45
+    container_name: etl-airbyte-server
+    environment:
+      AIRBYTE_VERSION: "0.50.45"
+      DATABASE_HOST: "airbyte-db"
+      DATABASE_PORT: "5432"
+      DATABASE_DB: "airbyte"
+      DATABASE_USER: "airbyte"
+      DATABASE_PASSWORD: "password"
+      TRACKING_STRATEGY: "logging"
+      WORKER_ENVIRONMENT: "docker"
+      WORKSPACE_ROOT: "/tmp/workspace"
+      LOCAL_ROOT: "/tmp/airbyte_local"
+      WEBAPP_URL: "http://localhost:8000/"
+      INTERNAL_API_HOST: "airbyte-server:8001"
+      S3_LOG_BUCKET: "warehouse"
+      S3_LOG_BUCKET_REGION: "us-east-1"
+      S3_MINIO_ENDPOINT: "http://minio:9000"
+      AWS_ACCESS_KEY_ID: "minioadmin"
+      AWS_SECRET_ACCESS_KEY: "minioadmin123"
+    volumes:
+      - airbyte-workspace:/tmp/workspace
+    ports:
+      - "8001:8001"
+    depends_on:
+      airbyte-db:
+        condition: service_healthy
+    networks:
+      - etl-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+  airbyte-webapp:
+    image: airbyte/webapp:0.50.45
+    container_name: etl-airbyte-webapp
+    environment:
+      AIRBYTE_VERSION: "0.50.45"
+      API_URL: "/api/v1/"
+      INTERNAL_API_HOST: "airbyte-server:8001"
+    ports:
+      - "8000:8080"
+    depends_on:
+      - airbyte-server
+    networks:
+      - etl-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+          cpus: "0.5"
+
+  # ── dbt (transformations) ─────────────────────────────────────────────────
+  dbt:
+    image: ghcr.io/dbt-labs/dbt-spark:1.7.2
+    container_name: etl-dbt
+    working_dir: /opt/dbt
+    environment:
+      DBT_PROFILES_DIR: "/opt/dbt"
+    volumes:
+      - ./dbt:/opt/dbt
+    networks:
+      - etl-network
+    depends_on:
+      - spark-thrift
+    # Run once and exit — triggered by Airflow
+    command: ["dbt", "debug", "--profiles-dir", "/opt/dbt", "--target", "docker"]
+    profiles:
+      - tools  # Only starts when explicitly requested
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  minio-data:
+    driver: local
+  postgres-data:
+    driver: local
+  airflow-logs:
+    driver: local
+  airflow-plugins:
+    driver: local
+  spark-work:
+    driver: local
+  airbyte-db-data:
+    driver: local
+  airbyte-workspace:
+    driver: local
+
+# ── Networks ──────────────────────────────────────────────────────────────────
+networks:
+  etl-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16

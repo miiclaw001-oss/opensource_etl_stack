@@ -1,0 +1,48 @@
+apiVersion: kind.x-k8s.io/v1alpha4
+kind: Cluster
+name: etl-stack
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"
+    extraPortMappings:
+      # MinIO Console
+      - containerPort: 30900
+        hostPort: 9000
+        protocol: TCP
+      - containerPort: 30901
+        hostPort: 9001
+        protocol: TCP
+      # Nessie REST API
+      - containerPort: 30019
+        hostPort: 19120
+        protocol: TCP
+      # Airflow webserver
+      - containerPort: 30808
+        hostPort: 8080
+        protocol: TCP
+      # Spark History Server
+      - containerPort: 30188
+        hostPort: 18080
+        protocol: TCP
+      # Airbyte webapp
+      - containerPort: 30800
+        hostPort: 8000
+        protocol: TCP
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/etl-data
+        containerPath: /data
+  - role: worker
+    extraMounts:
+      - hostPath: /tmp/etl-data
+        containerPath: /data
+networking:
+  apiServerAddress: "127.0.0.1"
+  apiServerPort: 6443
+  podSubnet: "10.244.0.0/16"
+  serviceSubnet: "10.96.0.0/12"

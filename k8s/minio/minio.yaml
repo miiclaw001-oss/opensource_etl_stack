@@ -1,0 +1,191 @@
+---
+# MinIO ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: minio-config
+  namespace: minio
+data:
+  MINIO_SITE_NAME: "etl-minio"
+  MINIO_BROWSER: "on"
+
+---
+# MinIO Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-secret
+  namespace: minio
+type: Opaque
+stringData:
+  MINIO_ROOT_USER: "minioadmin"
+  MINIO_ROOT_PASSWORD: "minioadmin123"
+
+---
+# MinIO PersistentVolumeClaim
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-pvc
+  namespace: minio
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+
+---
+# MinIO Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: minio
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:RELEASE.2024-01-18T22-51-28Z
+          command:
+            - minio
+            - server
+            - /data
+            - --console-address
+            - ":9001"
+          envFrom:
+            - configMapRef:
+                name: minio-config
+            - secretRef:
+                name: minio-secret
+          ports:
+            - containerPort: 9000
+              name: api
+            - containerPort: 9001
+              name: console
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-pvc
+
+---
+# MinIO API Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: minio
+  labels:
+    app: minio
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
+  type: ClusterIP
+
+---
+# MinIO NodePort Service (for local access)
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-nodeport
+  namespace: minio
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+      nodePort: 30900
+    - name: console
+      port: 9001
+      targetPort: 9001
+      nodePort: 30901
+  type: NodePort
+
+---
+# MinIO bucket init Job
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-init
+  namespace: minio
+spec:
+  template:
+    spec:
+      restartPolicy: OnFailure
+      initContainers:
+        - name: wait-for-minio
+          image: busybox:1.36
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z minio 9000; do
+                echo "Waiting for MinIO...";
+                sleep 2;
+              done
+      containers:
+        - name: mc
+          image: quay.io/minio/mc:RELEASE.2024-01-18T07-03-39Z
+          command:
+            - sh
+            - -c
+            - |
+              mc alias set local http://minio:9000 minioadmin minioadmin123
+              mc mb --ignore-existing local/warehouse
+              mc mb --ignore-existing local/warehouse-raw
+              mc mb --ignore-existing local/warehouse-silver
+              mc mb --ignore-existing local/warehouse-gold
+              mc anonymous set public local/warehouse
+              mc anonymous set public local/warehouse-raw
+              mc anonymous set public local/warehouse-silver
+              mc anonymous set public local/warehouse-gold
+              echo "Buckets created successfully"
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
