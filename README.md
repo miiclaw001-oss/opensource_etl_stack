@@ -2,34 +2,153 @@
 
 A production-grade local ETL stack built on Apache Iceberg — runs entirely on your laptop or Mac Mini.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Sources
+        A1[NYC Taxi CSV]
+        A2[Custom CSV]
+        A3[Airbyte Connector]
+    end
+
+    subgraph Ingestion
+        B1[Python Ingest Script]
+        B2[Airbyte 0.50]
+    end
+
+    subgraph Storage["☁️ MinIO (S3-compatible)"]
+        C1[(warehouse-raw)]
+        C2[(warehouse-silver)]
+        C3[(warehouse-gold)]
+    end
+
+    subgraph Catalog
+        D1[Project Nessie\nICEBERG REST API]
+    end
+
+    subgraph Processing
+        E1[Apache Spark 3.5\n+ Iceberg Runtime]
+        E2[dbt 1.7\n+ Spark Thrift]
+    end
+
+    subgraph Orchestration
+        F1[Apache Airflow 2.8\nDAG: etl_iceberg_pipeline]
+    end
+
+    A1 --> B1
+    A2 --> B1
+    A3 --> B2
+    B1 --> C1
+    B2 --> C1
+    C1 --> E1
+    E1 --> C2
+    E1 --> D1
+    C2 --> E2
+    E2 --> C3
+    E2 --> D1
+    C3 --> D1
+    F1 --> B1
+    F1 --> E1
+    F1 --> E2
 ```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                          LOCAL ETL STACK                                 │
-│                                                                          │
-│  Sources           Ingestion          Storage           Processing       │
-│                                                                          │
-│  ┌──────────┐     ┌──────────┐     ┌───────────┐     ┌──────────────┐  │
-│  │  NYC     │────▶│ Airbyte  │────▶│   MinIO   │◀───▶│    Spark     │  │
-│  │  Taxi    │     │  0.50    │     │  (S3)     │     │  3.5 +       │  │
-│  │  Data    │     └──────────┘     │           │     │  Iceberg     │  │
-│  └──────────┘                      │ warehouse │     └──────┬───────┘  │
-│                                    │  -raw     │            │          │
-│  ┌──────────┐     ┌──────────┐     │  -silver  │     ┌──────▼───────┐  │
-│  │  Custom  │────▶│  Python  │────▶│  -gold    │     │   Nessie     │  │
-│  │  CSV     │     │  Script  │     └─────▲─────┘     │   Catalog    │  │
-│  └──────────┘     └──────────┘           │            │  (REST API) │  │
-│                                          │            └─────────────┘  │
-│  ┌────────────────────────────────────────────────────────────────────┐ │
-│  │                      Orchestration (Airflow 2.8)                  │ │
-│  │  ingest → upload_raw → spark_raw_to_silver                        │ │
-│  │         → spark_silver_to_gold → dbt_run → dbt_test               │ │
-│  └────────────────────────────────────────────────────────────────────┘ │
-│                                                                          │
-│  ┌────────────────────────────────────────────────────────────────────┐ │
-│  │                  Transformations (dbt 1.7)                        │ │
-│  │  nessie.raw.trips ──▶ nessie.silver.trips ──▶ nessie.gold.*      │ │
-│  └────────────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────────────┘
+
+---
+
+## Data Flow (Medallion Architecture)
+
+```mermaid
+flowchart LR
+    subgraph Raw["🥉 Raw Layer\nwarehouse-raw"]
+        R1[CSV / Parquet\nNYC Taxi Fields\nPartitioned by date]
+    end
+
+    subgraph Silver["🥈 Silver Layer\nnessie.silver.trips"]
+        S1[Cleaned & Typed\nOutliers Removed\nFeature Engineered\nIncremental Merge]
+    end
+
+    subgraph Gold["🥇 Gold Layer\nnessie.gold.*"]
+        G1[daily_summary\nHourly KPIs]
+        G2[location_performance\nZone Rankings]
+    end
+
+    R1 -->|Spark raw_to_silver| S1
+    S1 -->|dbt silver_trips| S1
+    S1 -->|Spark silver_to_gold| G1
+    S1 -->|dbt gold models| G2
+```
+
+---
+
+## Airflow DAG
+
+```mermaid
+flowchart TD
+    start([▶ Start]) --> check{check_source_data}
+    check -->|data available| ingest[ingest_nyc_taxi\nDownload or generate data]
+    check -->|no data| skip[skip_pipeline]
+
+    ingest --> upload[upload_to_minio_raw\nCSV → warehouse-raw]
+    upload --> script1[write_raw_to_silver_script]
+    script1 --> spark1[spark_raw_to_silver\nCSV → Iceberg silver]
+    spark1 --> script2[write_silver_to_gold_script]
+    script2 --> spark2[spark_silver_to_gold\nsilver → gold aggregates]
+
+    spark2 --> dbt_run[dbt_run\nSQL transforms]
+    spark2 --> dq[data_quality_checks\nNessie + row validation]
+
+    dbt_run --> dbt_test[dbt_test]
+    dbt_test --> notify[notify_completion]
+    dq --> notify
+    skip --> notify
+    notify --> done([✅ End])
+
+    style spark1 fill:#ff9f43,color:#000
+    style spark2 fill:#ff9f43,color:#000
+    style dbt_run fill:#48dbfb,color:#000
+    style dbt_test fill:#48dbfb,color:#000
+    style dq fill:#ff6b6b,color:#fff
+    style notify fill:#1dd1a1,color:#000
+```
+
+---
+
+## dbt Lineage
+
+```mermaid
+flowchart LR
+    src[(iceberg_raw\n.nyc_taxi_trips)] --> raw[raw_trips\nview]
+    raw --> silver[silver_trips\nincremental iceberg\nmerge strategy]
+    silver --> g1[gold_daily_summary\npartitioned by date]
+    silver --> g2[gold_location_performance\nzone KPIs]
+
+    style src fill:#636e72,color:#fff
+    style raw fill:#fdcb6e,color:#000
+    style silver fill:#74b9ff,color:#000
+    style g1 fill:#55efc4,color:#000
+    style g2 fill:#55efc4,color:#000
+```
+
+---
+
+## Local Demo Pipeline (no Docker needed)
+
+```mermaid
+flowchart LR
+    csv[📄 Local CSV\n/tmp/nyc_taxi.csv] --> parse[Parse & Validate]
+    parse --> transform[Transform\nRaw → Silver\nbusiness rules]
+    transform --> dq{Data Quality\nChecks}
+    dq -->|pass| parquet[📦 Write Parquet\nsilver_trips.parquet]
+    dq -->|fail| drop[❌ Drop Row]
+    parquet --> gold[Aggregate\nGold Summary]
+    gold --> jsonl[📊 Gold JSONL\ngold_daily_summary.jsonl]
+    parquet -->|if MinIO up| minio_s[☁️ MinIO\nwarehouse-silver]
+    jsonl -->|if MinIO up| minio_g[☁️ MinIO\nwarehouse-gold]
+
+    style dq fill:#fdcb6e,color:#000
+    style parquet fill:#74b9ff,color:#000
+    style gold fill:#55efc4,color:#000
+    style drop fill:#ff7675,color:#fff
 ```
 
 ---
@@ -130,6 +249,65 @@ That's it. The full pipeline (ingest → Spark → dbt → gold tables) runs aut
 ---
 
 ## Use Cases
+
+---
+
+### Use Case 0: Local Demo (no Docker, runs now)
+
+**Best for:** trying the pipeline instantly, understanding the transform logic, CI without Docker.
+
+**Requirements:** Node.js ≥ 18, `npm install parquetjs-lite` (or runs with JSONL fallback)
+
+#### Step 1 — Install dep (optional, for real Parquet output)
+
+```bash
+cd opensource_etl_stack
+npm install parquetjs-lite
+```
+
+#### Step 2 — Run the demo
+
+```bash
+# Generate data + run full pipeline (no MinIO needed)
+node scripts/local_etl_demo.js --generate
+
+# Use your own CSV
+node scripts/local_etl_demo.js --csv /path/to/your/file.csv
+
+# With MinIO running: also uploads to warehouse-raw / warehouse-silver / warehouse-gold
+docker compose up -d minio && docker compose up minio-init
+node scripts/local_etl_demo.js --generate
+```
+
+#### What it does
+
+1. **Generate** — creates 1,000 synthetic NYC taxi rows (or reads your CSV)
+2. **Upload raw** — pushes CSV to `s3://warehouse-raw/nyc_taxi/year=.../month=.../` (if MinIO up)
+3. **Transform** — applies all silver business rules: type casting, outlier removal, feature engineering (`time_of_day`, `avg_speed_mph`, `tip_pct`, `fare_per_mile`, etc.)
+4. **Data quality checks** — asserts trip_distance, fare_amount, duration all in valid ranges
+5. **Write Parquet** — outputs `silver_trips.parquet` (~200 KB for 1k rows)
+6. **Upload silver** — pushes Parquet to `s3://warehouse-silver/silver/trips/` (if MinIO up)
+7. **Gold aggregation** — computes hourly revenue/trip KPIs
+8. **Write gold** — outputs `gold_daily_summary.jsonl`
+
+#### Expected output
+
+```
+✓ Generated synthetic CSV: /tmp/nyc_taxi_demo.csv
+✓ Parsed 1000 raw rows from CSV
+✓ Transformed 1000 rows (filtered 0 bad rows)
+✓ DQ: all trip_distance values in range (0–200 mi)
+✓ DQ: all fare_amount values in range ($0–$500)
+✓ DQ: all trip_duration_minutes in range (0–300 min)
+✓ DQ: time_of_day feature correctly computed
+✓ Silver file written: /tmp/silver_trips.parquet (198.9 KB)
+✓ Gold aggregation: 509 hourly buckets across 28 days
+✓ Total trips: 1,000
+✓ Total revenue: $44,262.56
+✓ Gold file written: /tmp/gold_daily_summary.jsonl
+
+✅ Pipeline complete!  Passed: 13  Failed: 0  Skipped: 2
+```
 
 ---
 
