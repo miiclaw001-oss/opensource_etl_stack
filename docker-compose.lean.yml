@@ -1,7 +1,7 @@
 version: "3.8"
 
 # =============================================================================
-# ETL Stack — LEAN  (kein DataHub)
+# ETL Stack — LEAN  (kein DataHub, kein Airbyte → Meltano)
 # =============================================================================
 #
 # Services:
@@ -10,30 +10,35 @@ version: "3.8"
 #   Spark          Master + Worker + Thrift        :7077 :8090 :8091 :10001
 #   PostgreSQL     Shared Metadata (Airflow)       intern
 #   Airflow        Webserver + Scheduler           :8080
-#   Airbyte        Server + Webapp                 :8000 :8001
+#   Meltano        ELT Ingestion (MIT)             CLI-basiert, kein Server nötig
 #   dbt            Transformation runner           (per Airflow-Task)
 #
-# RAM-Bedarf: ~5–6 GB (vs. ~12 GB mit DataHub)
+# RAM-Bedarf: ~4–5 GB (Meltano ist CLI, kein Always-On-Server)
+#
+# Lizenz: 100% open source, alles Apache 2.0 / MIT / PostgreSQL-License
 #
 # Starten (alles):
 #   docker compose -f docker-compose.lean.yml up -d
 #
-# Starten (nur Core — kein Airbyte/dbt):
+# Starten (nur Core ohne Meltano):
 #   docker compose -f docker-compose.lean.yml up -d \
 #     minio minio-init polaris polaris-init spark-master spark-worker spark-thrift \
 #     postgres airflow-init airflow-webserver airflow-scheduler
 #
-# Airbyte Use-Case: On-Prem → Cloud Migration
-#   Airbyte verbindet beliebige Quellen (Postgres, MySQL, REST APIs, S3, GCS, …)
-#   mit MinIO als Staging-Layer. Spark liest von dort und schreibt via Polaris
-#   in Iceberg-Tabellen. Beim Cloud-Umstieg nur MinIO-Endpoint tauschen
-#   (z.B. → AWS S3 / GCS / Azure ADLS).
+# Meltano Use-Case: On-Prem → Cloud Migration
+#   Meltano (Singer-basiert) verbindet beliebige Quellen (Postgres, MySQL,
+#   REST APIs, CSV, S3, GCS, Salesforce, …) mit MinIO als Staging-Layer.
+#   Beim Cloud-Umstieg nur den Target-Connector wechseln:
+#
+#     On-Prem:  Source → tap-* → target-s3 (MinIO) → Spark → Polaris
+#     Cloud:    Source → tap-* → target-s3 (AWS)   → Spark → Polaris
+#
+#   Der Rest (DAGs, Spark Jobs, dbt) bleibt 1:1 identisch.
 #
 # UIs:
 #   Airflow    http://localhost:8080   admin / admin123
 #   MinIO      http://localhost:9001   minioadmin / minioadmin123
 #   Spark      http://localhost:8090
-#   Airbyte    http://localhost:8000   (Setup beim ersten Start)
 #   Polaris    http://localhost:8181/api/catalog
 # =============================================================================
 
@@ -54,13 +59,14 @@ x-airflow-common: &airflow-common
     MINIO_ENDPOINT:        "http://minio:9000"
     POLARIS_URI:           "http://polaris:8181/api/catalog"
     POLARIS_CREDENTIAL:    "root:s3cr3t"
-    # Airbyte API (for DAGs that trigger syncs)
-    AIRBYTE_SERVER:        "http://airbyte-server:8001"
+    # Meltano project path (mounted into Airflow worker)
+    MELTANO_PROJECT_ROOT:  "/opt/meltano"
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - airflow-logs:/opt/airflow/logs
     - airflow-plugins:/opt/airflow/plugins
     - /tmp/etl-data:/tmp/etl-data
+    - ./meltano:/opt/meltano
   depends_on:
     postgres:
       condition: service_healthy
@@ -114,7 +120,7 @@ services:
         mc mb --ignore-existing local/warehouse-raw &&
         mc mb --ignore-existing local/warehouse-silver &&
         mc mb --ignore-existing local/warehouse-gold &&
-        mc mb --ignore-existing local/airbyte-staging &&
+        mc mb --ignore-existing local/meltano-staging &&
         mc mb --ignore-existing local/spark-logs &&
         echo 'MinIO buckets initialized'
       "
@@ -408,105 +414,78 @@ services:
           cpus: "1.0"
 
   # ════════════════════════════════════════════════════════════════════════════
-  # INGESTION — Airbyte
+  # INGESTION — Meltano  (MIT License, Singer-basiert)
   # ════════════════════════════════════════════════════════════════════════════
+  #
+  # Meltano ist ein CLI-basiertes ELT-Tool — kein Always-On-Server nötig.
+  # Es wird als einmaliger Container gestartet (via Airflow BashOperator
+  # oder manuell) und lädt Daten aus der Quelle in MinIO.
   #
   # Use-Case: On-Prem → Cloud Migration
   # ─────────────────────────────────────────────────────────────────────────
-  # Airbyte verbindet beliebige Quellen (Postgres, MySQL, Salesforce, REST APIs,
-  # Google Sheets, S3, GCS, …) mit dem Stack. Für den Cloud-Umstieg genügt es,
-  # den Destination-Connector zu wechseln:
+  # Singer-Taps (Quellen):  tap-postgres, tap-mysql, tap-csv, tap-rest-api,
+  #                         tap-salesforce, tap-google-sheets, tap-s3-csv, …
+  # Singer-Targets (Ziele): target-s3 (MinIO/AWS), target-jsonl, target-csv
   #
-  #   On-Prem:  Source → Airbyte → MinIO (s3://warehouse-raw) → Spark → Polaris
-  #   Cloud:    Source → Airbyte → S3/GCS/ADLS               → Spark → Polaris
+  #   On-Prem:  Source → tap-* → target-s3 → MinIO → Spark → Polaris
+  #   Cloud:    Source → tap-* → target-s3 → AWS S3 → Spark → Polaris
   #
-  # Das ETL-Modell (Airflow DAGs, Spark Jobs, dbt-Models) bleibt identisch —
-  # nur der Storage-Endpoint ändert sich.
+  # Nur AWS_ENDPOINT_URL ändern → fertig migriert.
   #
-  # Airbyte UI: http://localhost:8000
-  # Airbyte API: http://localhost:8001/api/v1
+  # Projekt-Init (einmalig):
+  #   docker compose -f docker-compose.lean.yml run --rm meltano \
+  #     meltano init .
+  #
+  # Connector hinzufügen (Beispiel: Postgres → S3):
+  #   docker compose -f docker-compose.lean.yml run --rm meltano \
+  #     meltano add extractor tap-postgres
+  #   docker compose -f docker-compose.lean.yml run --rm meltano \
+  #     meltano add loader target-s3
+  #
+  # Sync starten:
+  #   docker compose -f docker-compose.lean.yml run --rm meltano \
+  #     meltano run tap-postgres target-s3
+  #
+  # Via Airflow (BashOperator in DAG):
+  #   meltano --project-root /opt/meltano run tap-postgres target-s3
   # ════════════════════════════════════════════════════════════════════════════
 
-  airbyte-db:
-    image: postgres:13-alpine
-    container_name: lean-airbyte-db
+  meltano:
+    image: meltano/meltano:latest
+    container_name: lean-meltano
+    working_dir: /opt/meltano
     environment:
-      POSTGRES_USER:     "airbyte"
-      POSTGRES_PASSWORD: "password"
-      POSTGRES_DB:       "airbyte"
-    volumes:
-      - airbyte-db-data:/var/lib/postgresql/data
-    networks:
-      - etl-network
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U airbyte"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    deploy:
-      resources:
-        limits:
-          memory: 256m
-          cpus: "0.25"
-
-  airbyte-server:
-    image: airbyte/server:0.50.45
-    container_name: lean-airbyte-server
-    environment:
-      AIRBYTE_VERSION:      "0.50.45"
-      DATABASE_HOST:        "airbyte-db"
-      DATABASE_PORT:        "5432"
-      DATABASE_DB:          "airbyte"
-      DATABASE_USER:        "airbyte"
-      DATABASE_PASSWORD:    "password"
-      TRACKING_STRATEGY:    "logging"
-      WORKER_ENVIRONMENT:   "docker"
-      WORKSPACE_ROOT:       "/tmp/workspace"
-      LOCAL_ROOT:           "/tmp/airbyte_local"
-      WEBAPP_URL:           "http://localhost:8000/"
-      INTERNAL_API_HOST:    "airbyte-server:8001"
-      # MinIO als S3-Staging-Layer (On-Prem)
-      S3_LOG_BUCKET:        "airbyte-staging"
-      S3_LOG_BUCKET_REGION: "us-east-1"
-      S3_MINIO_ENDPOINT:    "http://minio:9000"
-      AWS_ACCESS_KEY_ID:    "minioadmin"
+      # MinIO als S3-Target (On-Prem)
+      AWS_ACCESS_KEY_ID:     "minioadmin"
       AWS_SECRET_ACCESS_KEY: "minioadmin123"
+      AWS_DEFAULT_REGION:    "us-east-1"
+      AWS_ENDPOINT_URL:      "http://minio:9000"   # → für Cloud einfach entfernen
+      # S3 Target Bucket
+      TARGET_S3_BUCKET:      "warehouse-raw"
+      TARGET_S3_PREFIX:      "meltano/"
+      # Meltano DB (State-Tracking)
+      MELTANO_DATABASE_URI:  "postgresql://airflow:airflow123@postgres:5432/meltano"
     volumes:
-      - airbyte-workspace:/tmp/workspace
-    ports:
-      - "8001:8001"
+      - ./meltano:/opt/meltano
+      - meltano-venv:/opt/meltano/.meltano
     depends_on:
-      airbyte-db:
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      postgres:
         condition: service_healthy
     networks:
       - etl-network
-    restart: unless-stopped
+    # Kein restart: unless-stopped — Meltano ist ein CLI-Tool, kein Daemon
+    # Wird per Airflow BashOperator oder manuell via `docker compose run` aufgerufen
+    profiles:
+      - ingestion   # docker compose --profile ingestion run meltano meltano run ...
     deploy:
       resources:
         limits:
-          memory: 1g
+          memory: 512m
           cpus: "1.0"
-
-  airbyte-webapp:
-    image: airbyte/webapp:0.50.45
-    container_name: lean-airbyte-webapp
-    environment:
-      AIRBYTE_VERSION:   "0.50.45"
-      API_URL:           "/api/v1/"
-      INTERNAL_API_HOST: "airbyte-server:8001"
-    ports:
-      - "8000:8080"
-    depends_on:
-      - airbyte-server
-    networks:
-      - etl-network
-    restart: unless-stopped
-    deploy:
-      resources:
-        limits:
-          memory: 256m
-          cpus: "0.5"
 
   # ════════════════════════════════════════════════════════════════════════════
   # TRANSFORMATION — dbt (per Airflow-Task, kein Always-On Service)
@@ -531,13 +510,12 @@ services:
 # VOLUMES & NETWORKS
 # ════════════════════════════════════════════════════════════════════════════
 volumes:
-  minio-data:       { driver: local }
-  postgres-data:    { driver: local }
-  airflow-logs:     { driver: local }
-  airflow-plugins:  { driver: local }
-  spark-work:       { driver: local }
-  airbyte-db-data:  { driver: local }
-  airbyte-workspace: { driver: local }
+  minio-data:      { driver: local }
+  postgres-data:   { driver: local }
+  airflow-logs:    { driver: local }
+  airflow-plugins: { driver: local }
+  spark-work:      { driver: local }
+  meltano-venv:    { driver: local }   # pip-Envs der Meltano-Plugins (cached)
 
 networks:
   etl-network:

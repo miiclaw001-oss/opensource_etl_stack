@@ -1,0 +1,121 @@
+version: 1
+default_environment: dev
+project_id: etl-stack-meltano
+
+# ── Environments ──────────────────────────────────────────────────────────────
+environments:
+  - name: dev
+    config:
+      plugins:
+        loaders:
+          - name: target-s3
+            config:
+              bucket: warehouse-raw
+              s3_endpoint_url: http://minio:9000     # On-Prem: MinIO
+              # s3_endpoint_url: ""                  # Cloud: AWS S3 (einfach auskommentieren)
+              prefix: meltano/
+              aws_access_key_id: minioadmin
+              aws_secret_access_key: minioadmin123
+              region_name: us-east-1
+
+  - name: prod
+    config:
+      plugins:
+        loaders:
+          - name: target-s3
+            config:
+              bucket: warehouse-raw
+              # s3_endpoint_url: ""    # Cloud S3 — kein custom endpoint
+              prefix: meltano/
+              # Credentials via env vars: AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY
+
+# ── Plugins ───────────────────────────────────────────────────────────────────
+plugins:
+  extractors:
+    # ── tap-csv: Lokale CSV-Dateien lesen ─────────────────────────────────────
+    - name: tap-csv
+      namespace: tap_csv
+      pip_url: git+https://github.com/MeltanoLabs/tap-csv.git
+      executable: tap-csv
+      config:
+        files:
+          - entity: nyc_taxi_trips
+            path: /tmp/etl-data/input.csv
+            keys: [VendorID, tpep_pickup_datetime]
+
+    # ── tap-postgres: Postgres-Datenbank lesen ────────────────────────────────
+    - name: tap-postgres
+      namespace: tap_postgres
+      pip_url: meltanolabs-tap-postgres
+      executable: tap-postgres
+      config:
+        host: postgres          # hostname im Docker-Netz
+        port: 5432
+        user: airflow
+        password: airflow123
+        database: airflow
+        # filter_schemas: ["public"]
+        # default_replication_method: FULL_TABLE
+
+    # ── tap-rest-api: Generischer REST-API-Tap ────────────────────────────────
+    - name: tap-rest-api-msdk
+      namespace: tap_rest_api_msdk
+      pip_url: tap-rest-api-msdk
+      executable: tap-rest-api-msdk
+      config:
+        api_url: https://api.example.com
+        streams:
+          - name: records
+            path: /records
+            primary_keys: [id]
+            replication_method: INCREMENTAL
+            replication_key: updated_at
+
+  loaders:
+    # ── target-s3: In MinIO (On-Prem) oder AWS S3 (Cloud) schreiben ───────────
+    - name: target-s3
+      namespace: target_s3
+      pip_url: target-s3
+      executable: target-s3
+      config:
+        bucket: warehouse-raw
+        prefix: meltano/
+        format: jsonl               # jsonl, csv oder parquet
+        compression: gzip
+        # s3_endpoint_url wird per Environment überschrieben (siehe oben)
+
+    # ── target-jsonl: Lokaler JSONL-Output (für Tests ohne MinIO) ────────────
+    - name: target-jsonl
+      namespace: target_jsonl
+      pip_url: meltanolabs-target-jsonl
+      executable: target-jsonl
+      config:
+        destination_path: /tmp/etl-data/output
+
+# ── Jobs (Pipelines) ──────────────────────────────────────────────────────────
+jobs:
+  - name: csv-to-s3
+    tasks:
+      - tap-csv target-s3
+
+  - name: postgres-to-s3
+    tasks:
+      - tap-postgres target-s3
+
+  - name: rest-api-to-s3
+    tasks:
+      - tap-rest-api-msdk target-s3
+
+  - name: csv-to-local          # Für lokales Testing ohne MinIO
+    tasks:
+      - tap-csv target-jsonl
+
+# ── Schedules (via Meltano Scheduler oder Airflow) ────────────────────────────
+schedules:
+  - name: daily-csv-ingest
+    job: csv-to-s3
+    interval: "@daily"
+
+  - name: hourly-postgres-sync
+    job: postgres-to-s3
+    interval: "@hourly"
