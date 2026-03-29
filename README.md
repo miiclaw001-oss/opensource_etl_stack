@@ -2,26 +2,35 @@
 
 A production-grade local ETL stack built on Apache Iceberg — runs entirely on your laptop or Mac Mini.
 
-**Stack:** MinIO · Apache Polaris · Apache Spark 3.5 · Apache Airflow 2.8 · dbt 1.7 · Airbyte 0.50 · DataHub
+**Stack:** MinIO · Apache Polaris · Apache Spark 3.5 · Apache Airflow 2.8 · Meltano · dbt 1.7 · DataHub (optional)
+
+> 💡 **Lean Stack** (`docker-compose.lean.yml`) — kein DataHub, Meltano statt Airbyte, ~4–5 GB RAM, 100% MIT/Apache 2.0
 
 ---
 
 ## Quick Start
 
+### Option A — Lean Stack (empfohlen, ~4–5 GB RAM, 100% OSS)
 ```bash
 git clone <repo-url>
 cd opensource_etl_stack
+docker compose -f docker-compose.lean.yml up -d
+```
+Airflow: http://localhost:8080 (admin / admin123) → DAG `etl_node_pipeline` triggern.
+
+### Option B — Full Stack (mit DataHub, ~8–10 GB RAM)
+```bash
 cp .env.example .env
 ./scripts/setup.sh --mode docker
+# oder:
+docker compose up -d
 ```
 
-Open Airflow at http://localhost:8080 (admin / admin123), trigger `etl_iceberg_pipeline`, and watch tasks turn green.
-
-**No Docker?** Try the instant local demo:
-
+### Option C — Lokal ohne Docker (sofort, 0 MB Download)
 ```bash
-npm install parquetjs-lite   # optional, for Parquet output
-node scripts/local_etl_demo.js --generate
+npm install parquetjs-lite   # optional, für echten Parquet-Output
+node scripts/etl_pipeline.js --generate
+# → 10/10 DQ Rules ✅, Parquet-Output in /tmp/
 ```
 
 ---
@@ -93,7 +102,9 @@ Der `polaris-init` Container legt beim Start automatisch den `warehouse`-Catalog
 
 ---
 
-## Service URLs (after stack start)
+## Service URLs
+
+### Lean Stack (`docker-compose.lean.yml`)
 
 | Service | URL | Login |
 |---------|-----|-------|
@@ -102,7 +113,32 @@ Der `polaris-init` Container legt beim Start automatisch den `warehouse`-Catalog
 | Polaris REST API | http://localhost:8181/api/catalog | root / s3cr3t |
 | Polaris Management | http://localhost:8181/api/management/v1 | root / s3cr3t |
 | Spark UI | http://localhost:8090 | — |
+
+### Full Stack (`docker-compose.yml`)
+
+| Service | URL | Login |
+|---------|-----|-------|
+| Airflow | http://localhost:8080 | admin / admin123 |
+| MinIO Console | http://localhost:9001 | minioadmin / minioadmin123 |
+| Polaris REST API | http://localhost:8181/api/catalog | root / s3cr3t |
+| Spark UI | http://localhost:8090 | — |
 | DataHub | http://localhost:9002 | datahub / datahub |
+
+## Ingestion: Meltano
+
+```bash
+# Connector hinzufügen (einmalig)
+docker compose -f docker-compose.lean.yml run --rm meltano \
+  meltano add extractor tap-postgres
+
+# Sync starten
+docker compose -f docker-compose.lean.yml run --rm meltano \
+  meltano run tap-postgres target-s3
+
+# On-Prem → Cloud: in meltano/meltano.yml AWS_ENDPOINT_URL auskommentieren
+```
+
+Verfügbare Taps: `tap-csv`, `tap-postgres`, `tap-rest-api-msdk` (vorkonfiguriert)
 
 ---
 
