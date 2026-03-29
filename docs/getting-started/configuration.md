@@ -32,7 +32,9 @@ Airflow is configured entirely via environment variables in `docker-compose.yml`
 | `AIRFLOW__CORE__FERNET_KEY` | hardcoded | Move to `.env` for production use |
 | `AIRFLOW__WEBSERVER__SECRET_KEY` | `etl-stack-secret-key-2024` | Move to `.env` for production use |
 | `MINIO_ENDPOINT` | `http://minio:9000` | Internal Docker DNS |
-| `NESSIE_URI` | `http://nessie:19120/api/v1` | Internal Docker DNS |
+| `POLARIS_URI` | `http://polaris:8181/api/catalog` | Iceberg REST Catalog (Polaris) |
+| `POLARIS_CREDENTIAL` | `root:s3cr3t` | Dev only — change in production |
+| `MELTANO_PROJECT_ROOT` | `/opt/meltano` | Meltano project mount path |
 
 To generate a secure Fernet key:
 
@@ -42,58 +44,81 @@ python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().
 
 ---
 
-## Reducing RAM Usage (8 GB Laptop)
+## Stack Variants
 
-Edit `docker-compose.yml` to reduce Spark worker memory:
+### Lean Stack (empfohlen)
 
-```yaml
-# Option A: Skip Airbyte entirely (use Python ingest)
-docker compose up -d minio nessie spark-master spark-worker postgres airflow-webserver airflow-scheduler
+```bash
+# Lean: Polaris + Meltano, kein DataHub (~4-5 GB RAM, 100% MIT/Apache 2.0)
+docker compose -f docker-compose.lean.yml up -d
 
-# Option B: Reduce Spark worker limits
-spark-worker:
-  environment:
-    SPARK_WORKER_MEMORY: "1g"   # was "2g"
-  deploy:
-    resources:
-      limits:
-        memory: 1.5g            # was 2.5g
+# Nur Core (kein Meltano/dbt):
+docker compose -f docker-compose.lean.yml up -d \
+  minio minio-init polaris polaris-init \
+  spark-master spark-worker spark-thrift \
+  postgres airflow-init airflow-webserver airflow-scheduler
 ```
 
-See [Resource Requirements](../reference/resources.md) for full per-service limits.
+### Full Stack
+
+```bash
+# Inkl. DataHub (~8-10 GB RAM)
+docker compose up -d
+```
 
 ---
 
-## Nessie Persistent Storage
+## Reducing RAM Usage
 
-By default, Nessie uses `IN_MEMORY` storage (catalog is wiped on container restart). To enable JDBC persistence via PostgreSQL:
+Spark Worker Memory reduzieren in `docker-compose.yml` / `docker-compose.lean.yml`:
 
 ```yaml
-nessie:
+spark-worker:
   environment:
-    NESSIE_VERSION_STORE_TYPE: "JDBC"
-    QUARKUS_DATASOURCE_JDBC_URL: "jdbc:postgresql://postgres:5432/nessie"
-    QUARKUS_DATASOURCE_USERNAME: "airflow"
-    QUARKUS_DATASOURCE_PASSWORD: "airflow123"
+    SPARK_WORKER_MEMORY: "1g"   # war "2g"
+  deploy:
+    resources:
+      limits:
+        memory: 1.5g            # war 2.5g
 ```
 
-Also add to `scripts/init_db.sql`:
+Siehe [Resource Requirements](../reference/resources.md) für alle Service-Limits.
 
-```sql
-CREATE DATABASE nessie;
-GRANT ALL PRIVILEGES ON DATABASE nessie TO airflow;
+---
+
+## Polaris: Persistente Catalog-Daten
+
+Polaris verwendet standardmäßig In-Memory-Storage (Catalog wird bei Neustart zurückgesetzt).
+Der `polaris-init`-Container legt den `warehouse`-Catalog bei jedem Start neu an — für lokale Entwicklung ausreichend.
+
+Für persistenten Storage: Polaris unterstützt Eclipse Link / relational persistence (siehe [Polaris Docs](https://polaris.apache.org/docs/)).
+
+---
+
+## Meltano: On-Prem → Cloud Migration
+
+In `meltano/meltano.yml` nur eine Zeile ändern:
+
+```yaml
+# On-Prem (MinIO):
+s3_endpoint_url: http://minio:9000
+
+# Cloud (AWS S3) — auskommentieren:
+# s3_endpoint_url: http://minio:9000
 ```
+
+Alle DAGs, Spark Jobs und dbt-Modelle bleiben unverändert.
 
 ---
 
 ## dbt Targets
 
-The `dbt/profiles.yml` defines two targets:
+Die `dbt/profiles.yml` definiert zwei Targets:
 
-- **`docker`** — connects to `spark-thrift:10001` (for use inside Docker Compose)
-- **`k8s`** — connects via port-forwarded `localhost:10001` (for Kubernetes mode)
+- **`docker`** — verbindet zu `spark-thrift:10001` (innerhalb Docker Compose)
+- **`k8s`** — via port-forwarded `localhost:10001` (Kubernetes-Modus)
 
-To run dbt locally (outside Docker):
+Lokal ausführen (außerhalb Docker):
 
 ```bash
 pip install dbt-spark==1.7.2 PyHive thrift

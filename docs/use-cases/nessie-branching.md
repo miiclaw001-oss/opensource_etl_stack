@@ -1,82 +1,103 @@
-# Use Case 7: Nessie Time-Travel & Branching
+# Use Case 7: Polaris Catalog — Time Travel & Management
 
-**Best for:** safe experimentation, A/B testing transforms, schema changes.
+**Best for:** Iceberg Time Travel, Catalog-Management, Schema-Inspektion.
+
+> ℹ️ Dieser Stack nutzt **Apache Polaris** (Iceberg REST Catalog Spec) statt Nessie.
+> Polaris unterstützt Iceberg Time Travel via Spark nativ.
 
 ---
 
-## List Branches and Tags
+## Polaris API: Token holen
 
 ```bash
-curl -s http://localhost:19120/api/v1/trees | python3 -m json.tool
+TOKEN=$(curl -sf -X POST 'http://localhost:8181/api/catalog/v1/oauth/tokens' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=client_credentials&client_id=root&client_secret=s3cr3t&scope=PRINCIPAL_ROLE:ALL' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
+echo "Token: ${TOKEN:0:30}..."
 ```
 
 ---
 
-## Create a Feature Branch
-
-```python
-import requests
-
-BASE = "http://localhost:19120/api/v1"
-
-# Get main branch hash
-main = requests.get(f"{BASE}/trees/tree/main").json()
-main_hash = main["hash"]
-
-# Create feature branch
-requests.post(f"{BASE}/trees/tree", json={
-    "name": "feature/new-gold-model",
-    "type": "BRANCH",
-    "hash": main_hash,
-    "sourceRefName": "main"
-}).raise_for_status()
-
-print("Branch created: feature/new-gold-model")
-```
-
----
-
-## Use a Branch in Spark
-
-```python
-# Point Spark at a specific branch
-spark.conf.set("spark.sql.catalog.nessie.ref", "feature/new-gold-model")
-
-# Now all writes go to the feature branch
-new_gold.writeTo("nessie.gold.new_model").using("iceberg").createOrReplace()
-
-# Merge: use the Nessie merge API when ready
-# In production, use Nessie merge API to promote changes to main
-```
-
----
-
-## Time-Travel with Spark
-
-```python
-# By timestamp
-spark.read.format("iceberg") \
-    .option("as-of-timestamp", "2024-01-15T12:00:00.000+00:00") \
-    .load("nessie.silver.trips") \
-    .count()
-
-# By snapshot ID (get from .snapshots table)
-snapshots = spark.sql("SELECT * FROM nessie.silver.trips.snapshots").collect()
-snapshot_id = snapshots[-2]["snapshot_id"]  # second-to-last snapshot
-
-spark.read.format("iceberg") \
-    .option("snapshot-id", snapshot_id) \
-    .load("nessie.silver.trips") \
-    .count()
-```
-
----
-
-## Expire Old Snapshots (Cleanup)
-
-The `iceberg_maintenance_dag` runs weekly automatically, or trigger it manually:
+## Catalog-Inhalt inspizieren
 
 ```bash
-docker compose exec airflow-webserver \
-    airflow dags trigger iceberg_maintenance_dag
+# Alle Catalogs
+curl -s http://localhost:8181/api/management/v1/catalogs \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+
+# Namespaces im warehouse-Catalog
+curl -s http://localhost:8181/api/catalog/v1/warehouse/namespaces \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+
+# Tables in silver
+curl -s http://localhost:8181/api/catalog/v1/warehouse/namespaces/silver/tables \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```
+
+---
+
+## Time Travel via Spark
+
+```python
+# Spark Shell starten (siehe Use Case 6)
+
+# Alle Snapshots anzeigen
+spark.sql("SELECT * FROM polaris.silver.trips.snapshots").show(truncate=False)
+
+# Zu einem bestimmten Zeitpunkt zurückgehen
+spark.sql("""
+    SELECT COUNT(*), SUM(total_amount)
+    FROM polaris.silver.trips
+    FOR SYSTEM_TIME AS OF '2024-01-15 12:00:00'
+""").show()
+
+# Zu einem bestimmten Snapshot-ID
+spark.sql("""
+    SELECT * FROM polaris.silver.trips
+    FOR VERSION AS OF 12345678901234567
+    LIMIT 10
+""").show()
+
+# Iceberg-Metadaten
+spark.sql("SELECT * FROM polaris.silver.trips.files LIMIT 5").show()
+spark.sql("SELECT * FROM polaris.silver.trips.manifests LIMIT 5").show()
+spark.sql("SELECT * FROM polaris.silver.trips.history").show()
+```
+
+---
+
+## Namespace anlegen
+
+```bash
+# Via API
+curl -sf -X POST http://localhost:8181/api/catalog/v1/warehouse/namespaces \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"namespace": ["staging"], "properties": {}}'
+
+# Via Spark
+spark.sql("CREATE NAMESPACE IF NOT EXISTS polaris.staging")
+```
+
+---
+
+## Table löschen (Rollback via Snapshots)
+
+```python
+# Auf alten Snapshot zurücksetzen
+spark.sql("""
+    CALL polaris.system.rollback_to_snapshot(
+      'silver.trips',
+      12345678901234567
+    )
+""")
+
+# Alte Snapshots aufräumen (Iceberg Expire)
+spark.sql("""
+    CALL polaris.system.expire_snapshots(
+      'silver.trips',
+      TIMESTAMP '2024-01-01 00:00:00'
+    )
+""")
 ```

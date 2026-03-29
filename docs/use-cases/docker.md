@@ -41,7 +41,7 @@ This script:
 | MinIO Console | http://localhost:9001 | minioadmin / minioadmin123 |
 | Airbyte | http://localhost:8000 | airbyte / password |
 | Spark UI | http://localhost:8090 | — |
-| Nessie API | http://localhost:19120/api/v1 | — |
+| Nessie API | http://localhost:8181/api/catalog | — |
 | DataHub | http://localhost:9002 | datahub / datahub |
 
 ## Step 4 — Trigger the Pipeline
@@ -64,7 +64,7 @@ docker compose exec airflow-webserver airflow dags trigger etl_iceberg_pipeline
 
 ```bash
 # Check Nessie tables
-curl http://localhost:19120/api/v1/trees/tree/main/entries
+curl http://localhost:8181/api/catalog/trees/tree/main/entries
 
 # Check raw data in MinIO
 docker compose exec minio-init mc ls local/warehouse-raw/nyc_taxi/

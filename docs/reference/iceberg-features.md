@@ -49,7 +49,7 @@ Nessie adds Git-like semantics on top of Iceberg:
 
 ```python
 import requests
-BASE = "http://localhost:19120/api/v1"
+BASE = "http://localhost:8181/api/catalog"
 
 # Create a branch
 main = requests.get(f"{BASE}/trees/tree/main").json()

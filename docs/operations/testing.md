@@ -142,7 +142,7 @@ Simulated the raw → silver → gold pipeline in pure Python:
 
 ```bash
 # Nessie API test
-curl -s http://localhost:19120/api/v1/trees/tree/main | python3 -m json.tool
+curl -s http://localhost:8181/api/catalog/trees/tree/main | python3 -m json.tool
 
 # Airflow DAG syntax check (no Airflow needed)
 python3 -m py_compile airflow/dags/etl_pipeline.py && echo "OK"

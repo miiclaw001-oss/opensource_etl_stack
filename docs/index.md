@@ -2,7 +2,7 @@
 
 A production-grade local ETL stack built on Apache Iceberg — runs entirely on your laptop or Mac Mini.
 
-**Key links:** [Airflow](http://localhost:8080) · [MinIO](http://localhost:9001) · [Nessie API](http://localhost:19120/api/v1) · [Spark UI](http://localhost:8090) · [DataHub](http://localhost:9002)
+**Key links:** [Airflow](http://localhost:8080) · [MinIO](http://localhost:9001) · [Nessie API](http://localhost:8181/api/catalog) · [Spark UI](http://localhost:8090) · [DataHub](http://localhost:9002)
 
 ---
 
