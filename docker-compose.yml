@@ -22,7 +22,7 @@ x-airflow-common: &airflow-common
     AWS_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD:-minioadmin123}"
     AWS_DEFAULT_REGION: "us-east-1"
     MINIO_ENDPOINT: "http://minio:9000"
-    NESSIE_URI: "http://nessie:19120/api/v1"
+    POLARIS_URI: "http://polaris:8181/api/catalog"
   volumes:
     - ./airflow/dags:/opt/airflow/dags
     - airflow-logs:/opt/airflow/logs
@@ -86,30 +86,56 @@ services:
     networks:
       - etl-network
 
-  # ── Project Nessie (Iceberg REST Catalog) ─────────────────────────────────
-  nessie:
-    image: ghcr.io/projectnessie/nessie:0.76.3
-    container_name: etl-nessie
+  # ── Apache Polaris (Iceberg REST Catalog) ─────────────────────────────────
+  polaris:
+    image: apache/polaris:latest
+    container_name: etl-polaris
     environment:
-      QUARKUS_HTTP_PORT: "19120"
-      NESSIE_VERSION_STORE_TYPE: "IN_MEMORY"
-      QUARKUS_LOG_LEVEL: "INFO"
+      POLARIS_BOOTSTRAP_CREDENTIALS: "POLARIS,root,s3cr3t"
+      AWS_ACCESS_KEY_ID: "minioadmin"
+      AWS_SECRET_ACCESS_KEY: "minioadmin123"
+      AWS_REGION: "us-east-1"
+      JAVA_OPTS: "-Xmx512m"
     ports:
-      - "19120:19120"
+      - "8181:8181"
     networks:
       - etl-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:19120/q/health/ready"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8181/healthcheck"]
       interval: 15s
       timeout: 10s
-      retries: 5
-      start_period: 30s
+      retries: 10
+      start_period: 60s
     deploy:
       resources:
         limits:
-          memory: 1g
+          memory: 768m
           cpus: "1.0"
+
+  polaris-init:
+    image: curlimages/curl:8.5.0
+    container_name: etl-polaris-init
+    depends_on:
+      polaris:
+        condition: service_healthy
+    networks:
+      - etl-network
+    entrypoint: >
+      /bin/sh -c "
+        echo '--- Polaris Bootstrap ---' &&
+        TOKEN=$$(curl -sf -X POST 'http://polaris:8181/api/catalog/v1/oauth/tokens' \
+          -H 'Content-Type: application/x-www-form-urlencoded' \
+          -d 'grant_type=client_credentials&client_id=root&client_secret=s3cr3t&scope=PRINCIPAL_ROLE:ALL' \
+          | grep -o '\"access_token\":\"[^\"]*\"' | sed 's/\"access_token\":\"//;s/\"//') &&
+        echo \"Token acquired\" &&
+        curl -sf -X POST 'http://polaris:8181/api/management/v1/catalogs' \
+          -H \"Authorization: Bearer $$TOKEN\" \
+          -H 'Content-Type: application/json' \
+          -d '{\"catalog\":{\"name\":\"warehouse\",\"type\":\"INTERNAL\",\"readOnly\":false,\"properties\":{\"default-base-location\":\"s3://warehouse/\"},\"storageConfigInfo\":{\"storageType\":\"S3\",\"allowedLocations\":[\"s3://warehouse/\"]}}}' &&
+        echo '--- Polaris catalog created ---'
+      "
+    restart: "no"
 
   # ── Apache Spark Master ────────────────────────────────────────────────────
   spark-master:
@@ -180,16 +206,17 @@ services:
           --hiveconf hive.server2.thrift.port=10001 \
           --hiveconf hive.server2.thrift.bind.host=0.0.0.0 \
           --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
-          --conf spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog \
-          --conf spark.sql.catalog.nessie.catalog-impl=org.apache.iceberg.nessie.NessieCatalog \
-          --conf spark.sql.catalog.nessie.uri=http://nessie:19120/api/v1 \
-          --conf spark.sql.catalog.nessie.ref=main \
-          --conf spark.sql.catalog.nessie.warehouse=s3://warehouse/ \
+          --conf spark.sql.catalog.polaris=org.apache.iceberg.spark.SparkCatalog \
+          --conf spark.sql.catalog.polaris.type=rest \
+          --conf spark.sql.catalog.polaris.uri=http://polaris:8181/api/catalog \
+          --conf spark.sql.catalog.polaris.warehouse=warehouse \
+          --conf spark.sql.catalog.polaris.credential=root:s3cr3t \
+          --conf spark.sql.catalog.polaris.scope=PRINCIPAL_ROLE:ALL \
           --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
           --conf spark.hadoop.fs.s3a.access.key=minioadmin \
           --conf spark.hadoop.fs.s3a.secret.key=minioadmin123 \
           --conf spark.hadoop.fs.s3a.path.style.access=true \
-          --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.3,org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.76.3,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 &&
+          --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.3,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 &&
         tail -f /opt/spark/logs/*thriftserver*
       "
     ports:
@@ -200,8 +227,10 @@ services:
     depends_on:
       spark-master:
         condition: service_healthy
-      nessie:
+      polaris:
         condition: service_healthy
+      polaris-init:
+        condition: service_completed_successfully
       minio:
         condition: service_healthy
       minio-init:
@@ -403,6 +432,206 @@ services:
     profiles:
       - tools  # Only starts when explicitly requested
 
+  # ── DataHub ─────────────────────────────────────────────────────────────────
+  datahub-zookeeper:
+    image: zookeeper:3.7
+    container_name: datahub-zookeeper
+    environment:
+      ZOO_MY_ID: 1
+      ZOO_PORT: 2181
+      ZOO_SERVERS: server.1=datahub-zookeeper:2888:3888;2181
+    networks:
+      - etl-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  datahub-kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: datahub-kafka
+    depends_on:
+      - datahub-zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: datahub-zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://datahub-kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_HEAP_OPTS: "-Xmx512m -Xms256m"
+    networks:
+      - etl-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+
+  datahub-schema-registry:
+    image: confluentinc/cp-schema-registry:7.4.0
+    container_name: datahub-schema-registry
+    depends_on:
+      - datahub-kafka
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: datahub-schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: datahub-kafka:9092
+    networks:
+      - etl-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  datahub-kafka-setup:
+    image: linkedin/datahub-kafka-setup:head
+    container_name: datahub-kafka-setup
+    depends_on:
+      - datahub-kafka
+      - datahub-schema-registry
+    environment:
+      KAFKA_BOOTSTRAP_SERVER: datahub-kafka:9092
+      KAFKA_SCHEMAREGISTRY_URL: http://datahub-schema-registry:8081
+    networks:
+      - etl-network
+    restart: "no"
+
+  datahub-elasticsearch:
+    image: elasticsearch:7.10.1
+    container_name: datahub-elasticsearch
+    environment:
+      discovery.type: single-node
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+    volumes:
+      - datahub-elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - etl-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9200/_cluster/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+
+  datahub-elasticsearch-setup:
+    image: linkedin/datahub-elasticsearch-setup:head
+    container_name: datahub-elasticsearch-setup
+    depends_on:
+      datahub-elasticsearch:
+        condition: service_healthy
+    environment:
+      ELASTICSEARCH_HOST: datahub-elasticsearch
+      ELASTICSEARCH_PORT: "9200"
+    networks:
+      - etl-network
+    restart: "no"
+
+  datahub-mysql:
+    image: mysql:5.7
+    container_name: datahub-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: datahub
+      MYSQL_DATABASE: datahub
+    volumes:
+      - datahub-mysql-data:/var/lib/mysql
+    networks:
+      - etl-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pdatahub"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  datahub-mysql-setup:
+    image: linkedin/datahub-mysql-setup:head
+    container_name: datahub-mysql-setup
+    depends_on:
+      datahub-mysql:
+        condition: service_healthy
+    environment:
+      MYSQL_HOST: datahub-mysql
+      MYSQL_PORT: "3306"
+      MYSQL_USERNAME: root
+      MYSQL_PASSWORD: datahub
+      DATAHUB_DB_NAME: datahub
+    networks:
+      - etl-network
+    restart: "no"
+
+  datahub-gms:
+    image: linkedin/datahub-gms:head
+    container_name: datahub-gms
+    depends_on:
+      - datahub-kafka-setup
+      - datahub-elasticsearch-setup
+      - datahub-mysql-setup
+    environment:
+      DATASET_ENABLE_SCROLL_API: "true"
+      EBEAN_DATASOURCE_USERNAME: root
+      EBEAN_DATASOURCE_PASSWORD: datahub
+      EBEAN_DATASOURCE_HOST: datahub-mysql:3306
+      EBEAN_DATASOURCE_URL: "jdbc:mysql://datahub-mysql:3306/datahub?verifyServerCertificate=false&useSSL=true&useUnicode=yes&characterEncoding=UTF-8"
+      EBEAN_DATASOURCE_DRIVER: com.mysql.jdbc.Driver
+      KAFKA_BOOTSTRAP_SERVER: datahub-kafka:9092
+      KAFKA_SCHEMAREGISTRY_URL: http://datahub-schema-registry:8081
+      ELASTICSEARCH_HOST: datahub-elasticsearch
+      ELASTICSEARCH_PORT: "9200"
+      GRAPH_SERVICE_IMPL: elasticsearch
+      MAE_CONSUMER_ENABLED: "true"
+      MCE_CONSUMER_ENABLED: "true"
+      DATAHUB_SERVER_TYPE: quickstart
+    ports:
+      - "8082:8080"
+    networks:
+      - etl-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          memory: 1.5g
+
+  datahub-frontend:
+    image: linkedin/datahub-frontend-react:head
+    container_name: datahub-frontend
+    depends_on:
+      datahub-gms:
+        condition: service_healthy
+    environment:
+      DATAHUB_GMS_HOST: datahub-gms
+      DATAHUB_GMS_PORT: "8080"
+      DATAHUB_APP_VERSION: "1.0"
+      DATAHUB_PLAY_MEM_BUFFER_SIZE: "10MB"
+      AUTH_OIDC_ENABLED: "false"
+      PLAY_HTTP_SECRET_KEY: "dh-secret-key-local-dev"
+    ports:
+      - "9002:9002"
+    networks:
+      - etl-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
 # ── Volumes ───────────────────────────────────────────────────────────────────
 volumes:
   minio-data:
@@ -418,6 +647,10 @@ volumes:
   airbyte-db-data:
     driver: local
   airbyte-workspace:
+    driver: local
+  datahub-mysql-data:
+    driver: local
+  datahub-elasticsearch-data:
     driver: local
 
 # ── Networks ──────────────────────────────────────────────────────────────────

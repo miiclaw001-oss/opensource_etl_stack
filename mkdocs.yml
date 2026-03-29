@@ -1,0 +1,78 @@
+site_name: Local Apache Iceberg ETL Stack
+site_description: Production-grade local ETL stack with Apache Iceberg, Spark, Airflow, dbt, Airbyte, and DataHub
+site_author: ETL Stack
+docs_dir: docs
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: blue
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: blue
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - toc.integrate
+    - content.code.annotate
+    - content.code.copy
+plugins:
+  - search
+  - mermaid2
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - admonition
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+  - tables
+  - attr_list
+  - md_in_html
+nav:
+  - Home: index.md
+  - Architecture:
+    - Overview: architecture/overview.md
+    - Data Flow: architecture/data-flow.md
+    - Components: architecture/components.md
+  - Getting Started:
+    - Prerequisites: getting-started/prerequisites.md
+    - Quick Start: getting-started/quickstart.md
+    - Configuration: getting-started/configuration.md
+  - Use Cases:
+    - Local Demo (No Docker): use-cases/local-demo.md
+    - Full Docker Stack: use-cases/docker.md
+    - Kubernetes (kind): use-cases/kubernetes.md
+    - Python Ingest Only: use-cases/python-ingest.md
+    - dbt Only: use-cases/dbt-only.md
+    - Spark Shell Queries: use-cases/spark-shell.md
+    - Nessie Time-Travel: use-cases/nessie-branching.md
+  - DataHub:
+    - Overview: datahub/overview.md
+    - Setup: datahub/setup.md
+    - Lineage & Metadata: datahub/lineage.md
+    - dbt Integration: datahub/dbt-integration.md
+  - Reference:
+    - Service URLs: reference/service-urls.md
+    - Resource Requirements: reference/resources.md
+    - Iceberg Features: reference/iceberg-features.md
+    - Project Structure: reference/project-structure.md
+  - Operations:
+    - Testing: operations/testing.md
+    - Troubleshooting: operations/troubleshooting.md
+    - Known Issues: operations/known-issues.md
