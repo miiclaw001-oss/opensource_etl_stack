@@ -1,5 +1,5 @@
 site_name: Local Apache Iceberg ETL Stack
-site_description: Production-grade local ETL stack with Apache Iceberg, Spark, Airflow, dbt, Airbyte, and DataHub
+site_description: Production-grade local ETL stack with Apache Iceberg, Spark, Airflow, Meltano, dbt, and Apache Polaris
 site_author: ETL Stack
 docs_dir: docs
 theme:
@@ -58,10 +58,10 @@ nav:
     - Local Demo (No Docker): use-cases/local-demo.md
     - Full Docker Stack: use-cases/docker.md
     - Kubernetes (kind): use-cases/kubernetes.md
-    - Python Ingest Only: use-cases/python-ingest.md
+    - Node.js / Python Ingest: use-cases/python-ingest.md
     - dbt Only: use-cases/dbt-only.md
     - Spark Shell Queries: use-cases/spark-shell.md
-    - Nessie Time-Travel: use-cases/nessie-branching.md
+    - Polaris Time-Travel & Catalog: use-cases/nessie-branching.md
   - DataHub:
     - Overview: datahub/overview.md
     - Setup: datahub/setup.md

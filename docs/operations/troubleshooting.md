@@ -19,11 +19,11 @@ lsof -i :9001
 
 ```bash
 # Correct health endpoint:
-curl http://localhost:19120/q/health
+curl http://localhost:8181/q/health
 # Correct API base:
-curl http://localhost:19120/api/v1/config
+curl http://localhost:8181/api/catalog/config
 # If 404 on all: check if Nessie started fully
-docker compose logs nessie | tail -30
+docker compose logs polaris | tail -30
 ```
 
 ---

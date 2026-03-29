@@ -1,34 +1,71 @@
-# Use Case 4: Python Ingest Only (No Airbyte)
+# Use Case 4: Node.js / Python Ingest (kein Meltano nötig)
 
-**Best for:** quick testing, when you have your own CSV/Parquet data.
+**Best for:** schnelles Testen, eigene CSV/Parquet-Daten, kein Docker nötig.
 
 ---
 
-## Step 1 — Generate Sample Data
+## Option A — Node.js ETL Pipeline (empfohlen, 0 Dependencies)
+
+Läuft ohne Docker, ohne Spark, ohne Meltano:
 
 ```bash
-python3 sample_data/generate_sample_data.py --rows 10000 --output /tmp/nyc_taxi.csv
+# Optional: echten Parquet-Output statt JSONL
+npm install parquetjs-lite
 
-# Or for a specific month:
-python3 sample_data/generate_sample_data.py \
-    --rows 50000 \
-    --year 2024 \
-    --month 3 \
-    --output /tmp/nyc_taxi_2024_03.csv
+# Synthetic data generieren + komplette Pipeline
+node scripts/etl_pipeline.js --generate
+
+# Eigene CSV
+node scripts/etl_pipeline.js --csv /tmp/meine_daten.csv
+
+# Mit MinIO (wenn Docker läuft) — wartet automatisch bis MinIO ready
+node scripts/etl_pipeline.js --generate --wait
 ```
 
-## Step 2 — Upload to MinIO Raw Bucket
+**Was passiert:**
+1. CSV einlesen / generieren
+2. Raw CSV → MinIO `warehouse-raw` hochladen
+3. Transform: Typing, DQ (10 Rules), Feature Engineering
+4. Parquet schreiben → MinIO `warehouse-silver`
+5. Gold-Aggregation → MinIO `warehouse-gold`
+6. Iceberg-Manifest schreiben
 
-Make sure MinIO is running first:
+---
+
+## Option B — Meltano (Singer-basiert, MIT)
 
 ```bash
-docker compose up -d minio && docker compose up minio-init
+# Meltano-Container starten (einmalig)
+docker compose -f docker-compose.lean.yml run --rm meltano \
+  meltano install
+
+# CSV → MinIO
+docker compose -f docker-compose.lean.yml run --rm meltano \
+  meltano run tap-csv target-s3
+
+# Postgres → MinIO
+docker compose -f docker-compose.lean.yml run --rm meltano \
+  meltano run tap-postgres target-s3
+
+# REST API → MinIO
+docker compose -f docker-compose.lean.yml run --rm meltano \
+  meltano run tap-rest-api-msdk target-s3
 ```
 
-Then upload:
+---
+
+## Option C — Manuell via AWS CLI / mc
+
+MinIO zuerst starten:
 
 ```bash
-# Using AWS CLI
+docker compose -f docker-compose.lean.yml up -d minio minio-init
+```
+
+Upload:
+
+```bash
+# AWS CLI
 AWS_ACCESS_KEY_ID=minioadmin \
 AWS_SECRET_ACCESS_KEY=minioadmin123 \
 aws s3 cp /tmp/nyc_taxi.csv \
@@ -36,28 +73,30 @@ aws s3 cp /tmp/nyc_taxi.csv \
     --endpoint-url http://localhost:9000 \
     --region us-east-1
 
-# Or using mc
+# MinIO mc
 mc alias set local http://localhost:9000 minioadmin minioadmin123
 mc cp /tmp/nyc_taxi.csv local/warehouse-raw/nyc_taxi/year=2024/month=01/
 ```
 
-## Step 3 — Run Spark Transformation (Raw → Silver)
+---
 
-Make sure Spark + Nessie + MinIO are running:
+## Spark Transformation: Raw → Silver (Polaris REST Catalog)
+
+Spark + Polaris + MinIO müssen laufen:
 
 ```bash
 docker compose exec spark-master spark-submit \
     --master spark://spark-master:7077 \
     --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.3,\
-org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.76.3,\
 org.apache.hadoop:hadoop-aws:3.3.4,\
 com.amazonaws:aws-java-sdk-bundle:1.12.262 \
     --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
-    --conf spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog \
-    --conf spark.sql.catalog.nessie.catalog-impl=org.apache.iceberg.nessie.NessieCatalog \
-    --conf spark.sql.catalog.nessie.uri=http://nessie:19120/api/v1 \
-    --conf spark.sql.catalog.nessie.ref=main \
-    --conf spark.sql.catalog.nessie.warehouse=s3://warehouse/ \
+    --conf spark.sql.catalog.polaris=org.apache.iceberg.spark.SparkCatalog \
+    --conf spark.sql.catalog.polaris.type=rest \
+    --conf spark.sql.catalog.polaris.uri=http://polaris:8181/api/catalog \
+    --conf spark.sql.catalog.polaris.warehouse=warehouse \
+    --conf spark.sql.catalog.polaris.credential=root:s3cr3t \
+    --conf spark.sql.catalog.polaris.scope=PRINCIPAL_ROLE:ALL \
     --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
     --conf spark.hadoop.fs.s3a.access.key=minioadmin \
     --conf spark.hadoop.fs.s3a.secret.key=minioadmin123 \
@@ -65,16 +104,22 @@ com.amazonaws:aws-java-sdk-bundle:1.12.262 \
     /path/to/raw_to_silver.py
 ```
 
-## Step 4 — Verify the Silver Table
+---
+
+## Verify: Polaris Catalog API
 
 ```bash
-curl http://localhost:19120/api/v1/trees/tree/main/entries \
-    | python3 -m json.tool | grep -A2 "silver"
-```
+# Token holen
+TOKEN=$(curl -sf -X POST 'http://localhost:8181/api/catalog/v1/oauth/tokens' \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d 'grant_type=client_credentials&client_id=root&client_secret=s3cr3t&scope=PRINCIPAL_ROLE:ALL' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['access_token'])")
 
-!!! tip
-    Install `pyarrow` for true Parquet output from the sample data generator:
-    ```bash
-    pip install pyarrow
-    ```
-    Without it, the generator silently falls back to CSV.
+# Namespaces anzeigen
+curl -s "http://localhost:8181/api/catalog/v1/warehouse/namespaces" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+
+# Tables in silver
+curl -s "http://localhost:8181/api/catalog/v1/warehouse/namespaces/silver/tables" \
+  -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+```

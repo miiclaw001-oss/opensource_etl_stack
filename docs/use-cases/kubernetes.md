@@ -38,7 +38,7 @@ kubectl get pods --all-namespaces
 kubectl port-forward -n minio svc/minio 9000:9000 9001:9001 &
 
 # Nessie
-kubectl port-forward -n nessie svc/nessie 19120:19120 &
+kubectl port-forward -n polaris svc/polaris 8181:8181 &
 
 # Airflow
 kubectl port-forward -n airflow svc/airflow-webserver 8080:8080 &
@@ -62,7 +62,7 @@ kubectl exec -n airflow $AIRFLOW_POD -- airflow dags trigger etl_iceberg_pipelin
 ```bash
 kubectl logs -n airflow deployment/airflow-scheduler -f
 kubectl logs -n spark deployment/spark-master -f
-kubectl logs -n nessie deployment/nessie -f
+kubectl logs -n polaris deployment/nessie -f
 ```
 
 ---
