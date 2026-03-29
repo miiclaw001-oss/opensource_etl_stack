@@ -1,0 +1,525 @@
+version: "3.8"
+
+# =============================================================================
+# ETL Stack — LEAN  (kein DataHub, kein Airbyte → Meltano)
+# =============================================================================
+#
+# Services:
+#   MinIO          S3-kompatibler Objektspeicher  :9000 (API) :9001 (Console)
+#   Polaris        Iceberg REST Catalog            :8181
+#   Spark          Master + Worker + Thrift        :7077 :8090 :8091 :10001
+#   PostgreSQL     Shared Metadata (Airflow)       intern
+#   Airflow        Webserver + Scheduler           :8080
+#   Meltano        ELT Ingestion (MIT)             CLI-basiert, kein Server nötig
+#   dbt            Transformation runner           (per Airflow-Task)
+#
+# RAM-Bedarf: ~4–5 GB (Meltano ist CLI, kein Always-On-Server)
+#
+# Lizenz: 100% open source, alles Apache 2.0 / MIT / PostgreSQL-License
+#
+# Starten (alles):
+#   docker compose -f docker-compose.lean.yml up -d
+#
+# Starten (nur Core ohne Meltano):
+#   docker compose -f docker-compose.lean.yml up -d \
+#     minio minio-init polaris polaris-init spark-master spark-worker spark-thrift \
+#     postgres airflow-init airflow-webserver airflow-scheduler
+#
+# Meltano Use-Case: On-Prem → Cloud Migration
+#   Meltano (Singer-basiert) verbindet beliebige Quellen (Postgres, MySQL,
+#   REST APIs, CSV, S3, GCS, Salesforce, …) mit MinIO als Staging-Layer.
+#   Beim Cloud-Umstieg nur den Target-Connector wechseln:
+#
+#     On-Prem:  Source → tap-* → target-s3 (MinIO) → Spark → Polaris
+#     Cloud:    Source → tap-* → target-s3 (AWS)   → Spark → Polaris
+#
+#   Der Rest (DAGs, Spark Jobs, dbt) bleibt 1:1 identisch.
+#
+# UIs:
+#   Airflow    http://localhost:8080   admin / admin123
+#   MinIO      http://localhost:9001   minioadmin / minioadmin123
+#   Spark      http://localhost:8090
+#   Polaris    http://localhost:8181/api/catalog
+# =============================================================================
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.0
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__FERNET_KEY: "ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg="
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow123@postgres:5432/airflow
+    AIRFLOW__WEBSERVER__SECRET_KEY: "etl-stack-secret-key-2024"
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW_CONN_SPARK_DEFAULT: "spark://spark-master:7077"
+    AWS_ACCESS_KEY_ID:     "${MINIO_ROOT_USER:-minioadmin}"
+    AWS_SECRET_ACCESS_KEY: "${MINIO_ROOT_PASSWORD:-minioadmin123}"
+    AWS_DEFAULT_REGION:    "us-east-1"
+    MINIO_ENDPOINT:        "http://minio:9000"
+    POLARIS_URI:           "http://polaris:8181/api/catalog"
+    POLARIS_CREDENTIAL:    "root:s3cr3t"
+    # Meltano project path (mounted into Airflow worker)
+    MELTANO_PROJECT_ROOT:  "/opt/meltano"
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - airflow-logs:/opt/airflow/logs
+    - airflow-plugins:/opt/airflow/plugins
+    - /tmp/etl-data:/tmp/etl-data
+    - ./meltano:/opt/meltano
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - etl-network
+  restart: unless-stopped
+
+services:
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # STORAGE — MinIO
+  # ════════════════════════════════════════════════════════════════════════════
+  minio:
+    image: quay.io/minio/minio:RELEASE.2024-01-18T22-51-28Z
+    container_name: lean-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER:     "${MINIO_ROOT_USER:-minioadmin}"
+      MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-minioadmin123}"
+      MINIO_SITE_NAME:     "etl-minio"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web Console
+    volumes:
+      - minio-data:/data
+    networks:
+      - etl-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2024-01-18T07-03-39Z
+    container_name: lean-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 minioadmin minioadmin123 &&
+        mc mb --ignore-existing local/warehouse     &&
+        mc mb --ignore-existing local/warehouse-raw &&
+        mc mb --ignore-existing local/warehouse-silver &&
+        mc mb --ignore-existing local/warehouse-gold &&
+        mc mb --ignore-existing local/meltano-staging &&
+        mc mb --ignore-existing local/spark-logs &&
+        echo 'MinIO buckets initialized'
+      "
+    networks:
+      - etl-network
+    restart: "no"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # CATALOG — Apache Polaris (Iceberg REST Catalog)
+  # ════════════════════════════════════════════════════════════════════════════
+  polaris:
+    image: apache/polaris:latest
+    container_name: lean-polaris
+    environment:
+      POLARIS_BOOTSTRAP_CREDENTIALS: "POLARIS,root,s3cr3t"
+      AWS_ACCESS_KEY_ID:     "minioadmin"
+      AWS_SECRET_ACCESS_KEY: "minioadmin123"
+      AWS_REGION:            "us-east-1"
+      JAVA_OPTS:             "-Xmx512m"
+    ports:
+      - "8181:8181"
+    networks:
+      - etl-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8181/healthcheck"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 768m
+          cpus: "1.0"
+
+  # Bootstrap: warehouse-Catalog + Namespaces anlegen
+  polaris-init:
+    image: curlimages/curl:8.5.0
+    container_name: lean-polaris-init
+    depends_on:
+      polaris:
+        condition: service_healthy
+    networks:
+      - etl-network
+    entrypoint: >
+      /bin/sh -c "
+        echo '--- Polaris Bootstrap ---' &&
+
+        TOKEN=$$(curl -sf -X POST 'http://polaris:8181/api/catalog/v1/oauth/tokens' \
+          -H 'Content-Type: application/x-www-form-urlencoded' \
+          -d 'grant_type=client_credentials&client_id=root&client_secret=s3cr3t&scope=PRINCIPAL_ROLE:ALL' \
+          | sed 's/.*access_token\":\"\([^\"]*\)\".*/\1/') &&
+
+        echo \"Token: $${TOKEN:0:20}...\" &&
+
+        curl -sf -X POST 'http://polaris:8181/api/management/v1/catalogs' \
+          -H \"Authorization: Bearer $$TOKEN\" \
+          -H 'Content-Type: application/json' \
+          -d '{
+            \"catalog\": {
+              \"name\": \"warehouse\",
+              \"type\": \"INTERNAL\",
+              \"readOnly\": false,
+              \"properties\": {
+                \"default-base-location\": \"s3://warehouse/\"
+              },
+              \"storageConfigInfo\": {
+                \"storageType\": \"S3\",
+                \"allowedLocations\": [\"s3://warehouse/\", \"s3://warehouse-silver/\", \"s3://warehouse-gold/\"]
+              }
+            }
+          }' && echo 'Catalog warehouse created' &&
+
+        curl -sf -X POST 'http://polaris:8181/api/catalog/v1/warehouse/namespaces' \
+          -H \"Authorization: Bearer $$TOKEN\" \
+          -H 'Content-Type: application/json' \
+          -d '{\"namespace\": [\"silver\"], \"properties\": {}}' &&
+        echo 'Namespace silver created' &&
+
+        curl -sf -X POST 'http://polaris:8181/api/catalog/v1/warehouse/namespaces' \
+          -H \"Authorization: Bearer $$TOKEN\" \
+          -H 'Content-Type: application/json' \
+          -d '{\"namespace\": [\"gold\"], \"properties\": {}}' &&
+        echo 'Namespace gold created' &&
+
+        echo '--- Polaris ready ---'
+      "
+    restart: "no"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # PROCESSING — Apache Spark
+  # ════════════════════════════════════════════════════════════════════════════
+  spark-master:
+    image: apache/spark:3.5.0-scala2.12-java17-python3-ubuntu
+    container_name: lean-spark-master
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      SPARK_MASTER_HOST:    "0.0.0.0"
+      SPARK_MASTER_PORT:    "7077"
+      SPARK_MASTER_WEBUI_PORT: "8090"
+      SPARK_NO_DAEMONIZE:   "true"
+    ports:
+      - "7077:7077"
+      - "8090:8090"
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - spark-work:/opt/spark/work
+    networks:
+      - etl-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8090"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+  spark-worker:
+    image: apache/spark:3.5.0-scala2.12-java17-python3-ubuntu
+    container_name: lean-spark-worker
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      SPARK_WORKER_MEMORY:  "2g"
+      SPARK_WORKER_CORES:   "2"
+      SPARK_WORKER_WEBUI_PORT: "8091"
+      SPARK_NO_DAEMONIZE:   "true"
+    ports:
+      - "8091:8091"
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+      - spark-work:/opt/spark/work
+    depends_on:
+      spark-master:
+        condition: service_healthy
+    networks:
+      - etl-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2.5g
+          cpus: "2.0"
+
+  # Spark Thrift Server — Iceberg REST Catalog via Polaris
+  spark-thrift:
+    image: apache/spark:3.5.0-scala2.12-java17-python3-ubuntu
+    container_name: lean-spark-thrift
+    command: >
+      /bin/bash -c "
+        /opt/spark/sbin/start-thriftserver.sh \
+          --master spark://spark-master:7077 \
+          --hiveconf hive.server2.thrift.port=10001 \
+          --hiveconf hive.server2.thrift.bind.host=0.0.0.0 \
+          --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.3,org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.262 \
+          --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
+          --conf spark.sql.catalog.polaris=org.apache.iceberg.spark.SparkCatalog \
+          --conf spark.sql.catalog.polaris.type=rest \
+          --conf spark.sql.catalog.polaris.uri=http://polaris:8181/api/catalog \
+          --conf spark.sql.catalog.polaris.warehouse=warehouse \
+          --conf spark.sql.catalog.polaris.credential=root:s3cr3t \
+          --conf spark.sql.catalog.polaris.scope=PRINCIPAL_ROLE:ALL \
+          --conf spark.sql.catalog.polaris.header.X-Iceberg-Access-Delegation=vended-credentials \
+          --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000 \
+          --conf spark.hadoop.fs.s3a.access.key=minioadmin \
+          --conf spark.hadoop.fs.s3a.secret.key=minioadmin123 \
+          --conf spark.hadoop.fs.s3a.path.style.access=true \
+          --conf spark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem \
+          --conf spark.hadoop.fs.s3a.aws.credentials.provider=org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider \
+          --conf spark.sql.shuffle.partitions=4 \
+          --conf spark.eventLog.enabled=true \
+          --conf spark.eventLog.dir=s3a://spark-logs/ &&
+        tail -f /opt/spark/logs/*thriftserver*
+      "
+    ports:
+      - "10001:10001"   # Thrift / JDBC
+      - "4040:4040"     # Spark UI
+    volumes:
+      - ./spark/conf/spark-defaults.conf:/opt/spark/conf/spark-defaults.conf:ro
+    depends_on:
+      spark-master:
+        condition: service_healthy
+      polaris:
+        condition: service_healthy
+      polaris-init:
+        condition: service_completed_successfully
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    networks:
+      - etl-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "2.0"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # DATABASE — PostgreSQL (Airflow + Airbyte Metadata)
+  # ════════════════════════════════════════════════════════════════════════════
+  postgres:
+    image: postgres:15-alpine
+    container_name: lean-postgres
+    environment:
+      POSTGRES_USER:         "airflow"
+      POSTGRES_PASSWORD:     "airflow123"
+      POSTGRES_DB:           "airflow"
+      POSTGRES_INITDB_ARGS:  "--encoding=UTF8"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    networks:
+      - etl-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "0.5"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # ORCHESTRATION — Apache Airflow
+  # ════════════════════════════════════════════════════════════════════════════
+  airflow-init:
+    <<: *airflow-common
+    container_name: lean-airflow-init
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create \
+          --username admin --firstname Admin --lastname User \
+          --role Admin --email admin@example.com \
+          --password admin123 || true &&
+        echo 'Airflow initialized'
+      "
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: lean-airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: lean-airflow-scheduler
+    command: scheduler
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    deploy:
+      resources:
+        limits:
+          memory: 1g
+          cpus: "1.0"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # INGESTION — Meltano  (MIT License, Singer-basiert)
+  # ════════════════════════════════════════════════════════════════════════════
+  #
+  # Meltano ist ein CLI-basiertes ELT-Tool — kein Always-On-Server nötig.
+  # Es wird als einmaliger Container gestartet (via Airflow BashOperator
+  # oder manuell) und lädt Daten aus der Quelle in MinIO.
+  #
+  # Use-Case: On-Prem → Cloud Migration
+  # ─────────────────────────────────────────────────────────────────────────
+  # Singer-Taps (Quellen):  tap-postgres, tap-mysql, tap-csv, tap-rest-api,
+  #                         tap-salesforce, tap-google-sheets, tap-s3-csv, …
+  # Singer-Targets (Ziele): target-s3 (MinIO/AWS), target-jsonl, target-csv
+  #
+  #   On-Prem:  Source → tap-* → target-s3 → MinIO → Spark → Polaris
+  #   Cloud:    Source → tap-* → target-s3 → AWS S3 → Spark → Polaris
+  #
+  # Nur AWS_ENDPOINT_URL ändern → fertig migriert.
+  #
+  # Projekt-Init (einmalig):
+  #   docker compose -f docker-compose.lean.yml run --rm meltano \
+  #     meltano init .
+  #
+  # Connector hinzufügen (Beispiel: Postgres → S3):
+  #   docker compose -f docker-compose.lean.yml run --rm meltano \
+  #     meltano add extractor tap-postgres
+  #   docker compose -f docker-compose.lean.yml run --rm meltano \
+  #     meltano add loader target-s3
+  #
+  # Sync starten:
+  #   docker compose -f docker-compose.lean.yml run --rm meltano \
+  #     meltano run tap-postgres target-s3
+  #
+  # Via Airflow (BashOperator in DAG):
+  #   meltano --project-root /opt/meltano run tap-postgres target-s3
+  # ════════════════════════════════════════════════════════════════════════════
+
+  meltano:
+    image: meltano/meltano:latest
+    container_name: lean-meltano
+    working_dir: /opt/meltano
+    environment:
+      # MinIO als S3-Target (On-Prem)
+      AWS_ACCESS_KEY_ID:     "minioadmin"
+      AWS_SECRET_ACCESS_KEY: "minioadmin123"
+      AWS_DEFAULT_REGION:    "us-east-1"
+      AWS_ENDPOINT_URL:      "http://minio:9000"   # → für Cloud einfach entfernen
+      # S3 Target Bucket
+      TARGET_S3_BUCKET:      "warehouse-raw"
+      TARGET_S3_PREFIX:      "meltano/"
+      # Meltano DB (State-Tracking)
+      MELTANO_DATABASE_URI:  "postgresql://airflow:airflow123@postgres:5432/meltano"
+    volumes:
+      - ./meltano:/opt/meltano
+      - meltano-venv:/opt/meltano/.meltano
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    networks:
+      - etl-network
+    # Kein restart: unless-stopped — Meltano ist ein CLI-Tool, kein Daemon
+    # Wird per Airflow BashOperator oder manuell via `docker compose run` aufgerufen
+    profiles:
+      - ingestion   # docker compose --profile ingestion run meltano meltano run ...
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+          cpus: "1.0"
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # TRANSFORMATION — dbt (per Airflow-Task, kein Always-On Service)
+  # ════════════════════════════════════════════════════════════════════════════
+  dbt:
+    image: ghcr.io/dbt-labs/dbt-spark:1.7.2
+    container_name: lean-dbt
+    working_dir: /opt/dbt
+    environment:
+      DBT_PROFILES_DIR: "/opt/dbt"
+    volumes:
+      - ./dbt:/opt/dbt
+    networks:
+      - etl-network
+    depends_on:
+      - spark-thrift
+    command: ["dbt", "debug", "--profiles-dir", "/opt/dbt", "--target", "docker"]
+    profiles:
+      - tools   # Nur bei explizitem docker compose --profile tools up
+
+# ════════════════════════════════════════════════════════════════════════════
+# VOLUMES & NETWORKS
+# ════════════════════════════════════════════════════════════════════════════
+volumes:
+  minio-data:      { driver: local }
+  postgres-data:   { driver: local }
+  airflow-logs:    { driver: local }
+  airflow-plugins: { driver: local }
+  spark-work:      { driver: local }
+  meltano-venv:    { driver: local }   # pip-Envs der Meltano-Plugins (cached)
+
+networks:
+  etl-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.21.0.0/16

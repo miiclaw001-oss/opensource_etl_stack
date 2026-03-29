@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 MINIO_ENDPOINT = os.getenv("MINIO_ENDPOINT", "http://minio.minio.svc.cluster.local:9000")
 MINIO_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID", "minioadmin")
 MINIO_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "minioadmin123")
-NESSIE_URI = os.getenv("NESSIE_URI", "http://nessie.nessie.svc.cluster.local:19120/api/v1")
+POLARIS_URI = os.getenv("POLARIS_URI", "http://polaris:8181/api/catalog")
 SPARK_MASTER = os.getenv("SPARK_MASTER", "spark://spark-master.spark.svc.cluster.local:7077")
 RAW_BUCKET = "s3a://warehouse-raw"
 SILVER_BUCKET = "s3a://warehouse-silver"
@@ -44,16 +44,15 @@ SPARK_SUBMIT_BASE = """
 spark-submit \
   --master {master} \
   --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.4.3,\
-org.projectnessie.nessie-integrations:nessie-spark-extensions-3.5_2.12:0.76.3,\
 org.apache.hadoop:hadoop-aws:3.3.4,\
 com.amazonaws:aws-java-sdk-bundle:1.12.262 \
   --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
-  --conf spark.sql.catalog.nessie=org.apache.iceberg.spark.SparkCatalog \
-  --conf spark.sql.catalog.nessie.catalog-impl=org.apache.iceberg.nessie.NessieCatalog \
-  --conf spark.sql.catalog.nessie.uri={nessie_uri} \
-  --conf spark.sql.catalog.nessie.ref=main \
-  --conf spark.sql.catalog.nessie.authentication.type=NONE \
-  --conf spark.sql.catalog.nessie.warehouse=s3://warehouse/ \
+  --conf spark.sql.catalog.polaris=org.apache.iceberg.spark.SparkCatalog \
+  --conf spark.sql.catalog.polaris.type=rest \
+  --conf spark.sql.catalog.polaris.uri={polaris_uri} \
+  --conf spark.sql.catalog.polaris.warehouse=warehouse \
+  --conf spark.sql.catalog.polaris.credential=root:s3cr3t \
+  --conf spark.sql.catalog.polaris.scope=PRINCIPAL_ROLE:ALL \
   --conf spark.hadoop.fs.s3a.endpoint={minio_endpoint} \
   --conf spark.hadoop.fs.s3a.access.key={access_key} \
   --conf spark.hadoop.fs.s3a.secret.key={secret_key} \
@@ -63,7 +62,7 @@ com.amazonaws:aws-java-sdk-bundle:1.12.262 \
   --conf spark.sql.shuffle.partitions=4 \
 """.format(
     master=SPARK_MASTER,
-    nessie_uri=NESSIE_URI,
+    polaris_uri=POLARIS_URI,
     minio_endpoint=MINIO_ENDPOINT,
     access_key=MINIO_ACCESS_KEY,
     secret_key=MINIO_SECRET_KEY,
@@ -250,20 +249,19 @@ def run_data_quality_checks(**context):
 import json
 import urllib.request
 
-# Check Nessie catalog for tables
-nessie_uri = "{nessie_uri}"
+# Check Polaris catalog health
+polaris_uri = "{polaris_uri}"
 try:
-    req = urllib.request.Request(f"{{nessie_uri}}/trees/tree/main")
+    req = urllib.request.Request(polaris_uri.replace("/api/catalog", "/healthcheck"))
     with urllib.request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read())
-        print(f"Nessie branch main hash: {{data.get('hash', 'unknown')}}")
-        print("DQ Check 1 PASSED: Nessie catalog accessible")
+        print(f"Polaris health status: {{resp.status}}")
+        print("DQ Check 1 PASSED: Polaris catalog accessible")
 except Exception as e:
-    print(f"DQ Check 1 WARNING: Nessie check failed: {{e}}")
+    print(f"DQ Check 1 WARNING: Polaris check failed: {{e}}")
 
 print("DQ Check 2 PASSED: Pipeline completed successfully")
 print("All data quality checks passed!")
-""".format(nessie_uri=NESSIE_URI)
+""".format(polaris_uri=POLARIS_URI)
 
     result = subprocess.run(
         ["python3", "-c", check_script],
@@ -289,7 +287,7 @@ def notify_completion(**context):
         f"  DAG: {dag_id}\n"
         f"  Run: {run_id}\n"
         f"  Date: {ds}\n"
-        f"  Stack: Airbyte → MinIO → Spark+Iceberg+Nessie → dbt → Gold\n"
+        f"  Stack: Airbyte → MinIO → Spark+Iceberg+Polaris → dbt → Gold\n"
     )
     return "Pipeline complete"
 
@@ -298,7 +296,7 @@ def notify_completion(**context):
 
 RAW_TO_SILVER_SCRIPT = """\
 #!/usr/bin/env python3
-\"\"\"Spark job: raw CSV → silver Iceberg table (via Nessie catalog)\"\"\"
+\"\"\"Spark job: raw CSV → silver Iceberg table (via Polaris REST catalog)\"\"\"
 import sys
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -362,20 +360,20 @@ silver_df = (
 
 print(f"Silver row count: {silver_df.count()}")
 
-# Write to Iceberg table via Nessie
-spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.silver")
-silver_df.writeTo("nessie.silver.trips") \\
+# Write to Iceberg table via Polaris
+spark.sql("CREATE NAMESPACE IF NOT EXISTS polaris.silver")
+silver_df.writeTo("polaris.silver.trips") \\
     .using("iceberg") \\
     .partitionedBy(F.days("pickup_datetime")) \\
     .createOrReplace()
 
-print("Silver table written successfully to nessie.silver.trips")
+print("Silver table written successfully to polaris.silver.trips")
 spark.stop()
 """
 
 SILVER_TO_GOLD_SCRIPT = """\
 #!/usr/bin/env python3
-\"\"\"Spark job: silver Iceberg table → gold daily summary\"\"\"
+\"\"\"Spark job: silver Iceberg table → gold daily summary (via Polaris REST catalog)\"\"\"
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
@@ -386,7 +384,7 @@ spark = (
 )
 
 # Read from silver Iceberg table
-silver_df = spark.table("nessie.silver.trips")
+silver_df = spark.table("polaris.silver.trips")
 print(f"Silver rows: {silver_df.count()}")
 
 # Daily summary aggregation
@@ -420,13 +418,13 @@ print(f"Gold rows: {gold_df.count()}")
 gold_df.show(5)
 
 # Write to Iceberg gold table
-spark.sql("CREATE NAMESPACE IF NOT EXISTS nessie.gold")
-gold_df.writeTo("nessie.gold.daily_summary") \\
+spark.sql("CREATE NAMESPACE IF NOT EXISTS polaris.gold")
+gold_df.writeTo("polaris.gold.daily_summary") \\
     .using("iceberg") \\
     .partitionedBy("pickup_date") \\
     .createOrReplace()
 
-print("Gold table written successfully to nessie.gold.daily_summary")
+print("Gold table written successfully to polaris.gold.daily_summary")
 spark.stop()
 """
 
@@ -434,13 +432,13 @@ spark.stop()
 
 with DAG(
     dag_id="etl_iceberg_pipeline",
-    description="Full ETL pipeline: NYC Taxi → MinIO (raw) → Spark+Iceberg → Nessie → Gold",
+    description="Full ETL pipeline: NYC Taxi → MinIO (raw) → Spark+Iceberg → Polaris → Gold",
     default_args=default_args,
     start_date=datetime(2024, 1, 1),
     schedule_interval="0 6 * * *",  # Daily at 6am
     catchup=False,
     max_active_runs=1,
-    tags=["etl", "iceberg", "spark", "nessie", "nyc-taxi"],
+    tags=["etl", "iceberg", "spark", "polaris", "nyc-taxi"],
     doc_md=__doc__,
 ) as dag:
 
