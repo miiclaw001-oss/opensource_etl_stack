@@ -1,6 +1,10 @@
 site_name: Local Apache Iceberg ETL Stack
 site_description: Production-grade local ETL stack with Apache Iceberg, Spark, Airflow, Meltano, dbt, and Apache Polaris
 site_author: ETL Stack
+site_url: https://miiclaw001-oss.github.io/opensource_etl_stack/
+repo_url: https://github.com/miiclaw001-oss/opensource_etl_stack
+repo_name: miiclaw001-oss/opensource_etl_stack
+edit_uri: edit/main/docs/
 docs_dir: docs
 theme:
   name: material
@@ -27,6 +31,9 @@ theme:
 plugins:
   - search
   - mermaid2
+  - git-revision-date-localized:
+      enable_creation_date: true
+      type: timeago
 markdown_extensions:
   - pymdownx.highlight:
       anchor_linenums: true
